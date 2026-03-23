@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flashback-terminal"
+version = "0.1.0"
+description = "Recoverable web terminal with semantic search and session history"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Flashback Terminal Contributors"}
+]
+keywords = ["terminal", "xterm", "web-terminal", "session-recovery", "search"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "sqlalchemy>=2.0.0",
+    "aiosqlite>=0.19.0",
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "apscheduler>=3.10.0",
+    "python-multipart>=0.0.6",
+    "websockets>=12.0",
+    "rank-bm25>=0.2.2",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+embedding = [
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+flashback-terminal = "flashback_terminal.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/flashback-terminal"
+Repository = "https://github.com/yourusername/flashback-terminal"
+Issues = "https://github.com/yourusername/flashback-terminal/issues"

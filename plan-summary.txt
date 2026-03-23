@@ -1,0 +1,73 @@
+Recoverable Web Terminal - Project Summary
+==========================================
+
+Overview
+--------
+A modular, recoverable web-based terminal using Python (FastAPI) backend and xterm.js frontend. Supports global/semantic search, session recovery, screenshots, and configurable profiles.
+
+Core Features
+-------------
+- WebSocket-based terminal sessions with xterm.js rendering
+- Multiple tabs with rename capability
+- Terminal profiles (command, args, env, cwd configuration)
+- Global text and semantic search across terminal histories
+- Automatic history logging with configurable retention (default 10 days)
+- Periodic screenshots (configurable interval, default 10s)
+- Session recovery (replay history + restore working directory)
+- Optional modules: semantic search, history keeper, screenshot capture
+
+Retention Strategy
+------------------
+Two modes: ARCHIVE or DELETE.
+- Archive mode supports total_archive_size_limit and max_archive_age constraints
+- Archive labeling by date range (age_from/age_to)
+- Ring buffer approach for gradual archiving
+- Safe archive workflow: archive.inprogress folder before final commit
+
+Tech Stack
+----------
+Backend: Python, FastAPI, WebSocket, SQLAlchemy, SQLite/PostgreSQL
+Frontend: xterm.js, vanilla JS, canvas capture
+Optional: sentence-transformers, ChromaDB/FAISS for embeddings
+
+Project Structure
+-----------------
+backend/
+  app/
+    main.py, config.py
+    models/           # Database models
+    services/         # Modular business logic
+      terminal_manager.py
+      profile_manager.py
+      history_logger.py
+      screenshot_capturer.py
+      embedding_service.py
+      search_engine.py
+      session_recovery.py
+      retention_manager.py
+    api/
+      websocket.py
+      rest.py
+frontend/
+  index.html, app.js, style.css
+
+Key APIs
+--------
+WS /ws/terminal/{session_id}     Terminal I/O
+REST /api/sessions               CRUD + restore sessions
+REST /api/profiles               Terminal profiles
+REST /api/search                 Text/semantic search
+REST /api/history/{id}           Session history
+REST /api/screenshots/{id}       Session screenshots
+
+Implementation Phases
+---------------------
+1. Basic terminal (WebSocket + PTY + xterm.js)
+2. Multiple tabs
+3. Profiles
+4. History logging + text search
+5. Session recovery
+6. Screenshots
+7. Semantic search (optional)
+8. Retention management (archive/delete)
+9. Modularization + configuration

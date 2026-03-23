@@ -1,0 +1,718 @@
+Recoverable Web Terminal - Comprehensive Plan
+=============================================
+
+==============================================================================
+1. SYSTEM ARCHITECTURE
+==============================================================================
+
+1.1 Component Overview
+----------------------
++---------------+        WebSocket/HTTP         +-------------------------+
+|   Frontend    | <---------------------------> |        Backend          |
+|  (xterm.js)   |                               |      (FastAPI)          |
++---------------+                               +-------------------------+
+        |                                                |
+        | Canvas capture                                 | PTY processes
+        v                                                v
++---------------+                               +-------------------------+
+|  Screenshots  |                               |  History/Embeddings/DB  |
+|  (uploaded)   |                               |                         |
++---------------+                               +-------------------------+
+
+1.2 Data Flow
+-------------
+1. Client opens WebSocket to /ws/terminal/{session_id}
+2. Backend spawns PTY process (based on profile) or reconnects to existing
+3. Terminal output flows: PTY -> Backend -> (Logger/Embedding Service) -> Client
+4. Terminal input flows: Client -> Backend -> PTY
+5. Frontend periodically captures canvas, uploads screenshots via REST
+6. Search queries hit REST API, query DB + Vector store
+
+==============================================================================
+2. PROJECT STRUCTURE
+==============================================================================
+
+terminal_searcher/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py                 # FastAPI app factory, lifespan manager
+│   │   ├── config.py               # Pydantic settings, YAML loader
+│   │   ├── dependencies.py         # DI container for services
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── database.py         # SQLAlchemy engine/session
+│   │   │   ├── session.py          # Session model
+│   │   │   ├── terminal_output.py  # History chunks model
+│   │   │   ├── screenshot.py       # Screenshot metadata model
+│   │   │   └── embedding.py        # Embedding reference model
+│   │   ├── services/
+│   │   │   ├── __init__.py
+│   │   │   ├── base_service.py     # Abstract base for optional services
+│   │   │   ├── terminal_manager.py # PTY lifecycle, WebSocket routing
+│   │   │   ├── profile_manager.py  # Profile validation, loading
+│   │   │   ├── history_logger.py   # Raw output logging, FTS indexing
+│   │   │   ├── screenshot_handler.py # Receives frontend screenshots
+│   │   │   ├── embedding_service.py # Vector generation (optional)
+│   │   │   ├── search_engine.py    # Text + semantic search
+│   │   │   ├── session_recovery.py # History replay, cwd restore
+│   │   │   └── retention_manager.py # Archive/delete old data
+│   │   ├── api/
+│   │   │   ├── __init__.py
+│   │   │   ├── websocket.py        # Terminal WebSocket endpoint
+│   │   │   └── rest.py             # All REST endpoints
+│   │   └── utils/
+│   │       ├── __init__.py
+│   │       └── archive_utils.py    # Ring buffer, safe archive helpers
+│   ├── storage/
+│   │   ├── logs/                   # Raw terminal output files
+│   │   ├── screenshots/            # PNG screenshots
+│   │   ├── embeddings/             # Vector store data (Chroma/FAISS)
+│   │   └── archive/                # Archived sessions
+│   │       ├── archive.inprogress/ # Temporary during archive operation
+│   │       └── YYYY-MM/            # Organized by month
+│   ├── config.yaml                 # Main configuration
+│   ├── requirements.txt
+│   └── run.py                      # Entry point
+├── frontend/
+│   ├── index.html
+│   ├── css/
+│   │   └── style.css
+│   ├── js/
+│   │   ├── app.js                  # Main application
+│   │   ├── terminal.js             # xterm.js wrapper
+│   │   ├── tabs.js                 # Tab management
+│   │   ├── search.js               # Search UI
+│   │   ├── screenshot.js           # Canvas capture
+│   │   └── api.js                  # HTTP client
+│   └── lib/                        # Vendor libraries
+└── README.md
+
+==============================================================================
+3. CONFIGURATION FILE (config.yaml)
+==============================================================================
+
+general:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+  log_level: "info"
+
+storage:
+  log_dir: "./backend/storage/logs"
+  screenshot_dir: "./backend/storage/screenshots"
+  embedding_dir: "./backend/storage/embeddings"
+  archive_dir: "./backend/storage/archive"
+  db_url: "sqlite:///./backend/storage/terminal.db"
+  # Alternative: "postgresql://user:pass@localhost/terminal"
+
+# =============================================================================
+# RETENTION CONFIGURATION (see Section 8 for implementation details)
+# =============================================================================
+retention:
+  enabled: true
+
+  # Strategy: "delete" | "archive"
+  # - delete: Permanently remove old data
+  # - archive: Move to archive storage, can be restored later
+  strategy: "archive"
+
+  # History retention period
+  history_days: 10
+
+  # Archive constraints (only used when strategy="archive")
+  archive:
+    # Max total size of all archives (bytes, 0 = unlimited)
+    total_size_limit: 10737418240  # 10 GB
+
+    # Max age of archives before forced deletion (days, 0 = unlimited)
+    max_age_days: 90
+
+    # Compression format: "gzip" | "bz2" | "xz" | null
+    compression: "gzip"
+
+    # Archive organization: "flat" | "monthly" | "yearly"
+    organization: "monthly"
+
+  # Screenshot retention (can differ from history)
+  screenshots:
+    retention_days: 7
+    strategy: "delete"  # Screenshots usually deleted, not archived
+
+  # Embedding retention (should match history for consistency)
+  embeddings:
+    retention_days: 10
+    strategy: "delete"  # Can be regenerated from history
+
+  # Schedule for retention job (cron expression)
+  schedule: "0 2 * * *"  # Daily at 2 AM
+
+# =============================================================================
+# MODULE TOGGLES (all features are optional/modular)
+# =============================================================================
+modules:
+  history_keeper:
+    enabled: true
+    buffer_size: 4096           # Bytes per chunk
+    use_fts: true               # Enable full-text search index
+
+  screenshot_capture:
+    enabled: true
+    interval_seconds: 10
+    format: "png"               # "png" | "jpeg"
+    quality: 80                 # For JPEG
+    max_per_session: 1000       # 0 = unlimited
+
+  semantic_search:
+    enabled: false
+    model: "all-MiniLM-L6-v2"   # sentence-transformers model
+    device: "cpu"               # "cpu" | "cuda"
+    vector_db: "chromadb"       # "chromadb" | "faiss"
+    chunk_size: 512             # Characters per embedding chunk
+    chunk_overlap: 50           # Overlap between chunks
+
+  session_recovery:
+    enabled: true
+    max_recovery_age_days: 30   # Can't recover sessions older than this
+    replay_speed: "instant"     # "instant" | "realtime"
+
+  cwd_tracking:
+    enabled: true
+    method: "pwd_injection"     # "pwd_injection" | "parse_prompt"
+    injection_interval: 5000    # Milliseconds between pwd commands
+
+# =============================================================================
+# PROFILES
+# =============================================================================
+profiles:
+  - name: "default"
+    command: "/bin/bash"
+    args: []
+    env: {}
+    cwd: "~"
+    description: "Standard bash shell"
+    icon: "terminal"
+
+  - name: "python"
+    command: "/usr/bin/python3"
+    args: ["-i"]
+    env:
+      PYTHONSTARTUP: "~/.pythonrc"
+    cwd: "~"
+    description: "Python interactive shell"
+    icon: "python"
+
+  - name: "ssh-prod"
+    command: "/usr/bin/ssh"
+    args: ["user@prod-server.example.com"]
+    env: {}
+    cwd: "~"
+    description: "SSH to production server"
+    icon: "server"
+
+search:
+  text_search_enabled: true
+  semantic_search_enabled: false
+  max_results: 50
+  context_lines: 3              # Lines of context around matches
+
+security:
+  require_auth: false           # Set true for JWT/OAuth2
+  allowed_hosts: ["localhost", "127.0.0.1"]
+  max_sessions_per_user: 10     # 0 = unlimited
+
+==============================================================================
+4. DATABASE SCHEMA
+==============================================================================
+
+-- Sessions table
+CREATE TABLE sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid TEXT UNIQUE NOT NULL,           -- External identifier
+    name TEXT,                            -- User-defined tab name
+    profile_name TEXT NOT NULL,           -- Reference to profile
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_active_at DATETIME,
+    ended_at DATETIME,
+    last_cwd TEXT,                        -- Last known working directory
+    status TEXT CHECK(status IN ('active', 'inactive', 'archived')) DEFAULT 'active',
+    recovery_attempted INTEGER DEFAULT 0, -- Track if recovery was tried
+    recovery_error TEXT,                  -- Error message if recovery failed
+    metadata JSON                         -- Flexible additional data
+);
+
+-- Terminal output chunks (for replay and search)
+CREATE TABLE terminal_output (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    sequence_num INTEGER NOT NULL,       -- Ordering within session
+    content TEXT NOT NULL,               -- The actual text content
+    content_type TEXT DEFAULT 'output',  -- 'output' | 'input' | 'system'
+    byte_offset INTEGER,                 -- Offset in raw log file
+    byte_length INTEGER                  -- Length in raw log file
+);
+
+-- Full-text search virtual table (SQLite FTS5)
+CREATE VIRTUAL TABLE terminal_output_fts USING fts5(
+    content,
+    content_rowid=rowid,
+    tokenize='porter'
+);
+
+-- Screenshot metadata
+CREATE TABLE screenshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    file_path TEXT NOT NULL,
+    file_size INTEGER,
+    width INTEGER,
+    height INTEGER,
+    is_archived INTEGER DEFAULT 0
+);
+
+-- Embedding references (actual vectors in ChromaDB/FAISS)
+CREATE TABLE embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    output_chunk_id INTEGER REFERENCES terminal_output(id) ON DELETE CASCADE,
+    vector_id TEXT NOT NULL,             -- ID in vector store
+    model_name TEXT NOT NULL,            -- Which embedding model
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_archived INTEGER DEFAULT 0
+);
+
+-- Archive manifest (tracks what's been archived)
+CREATE TABLE archive_manifest (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    archive_path TEXT NOT NULL,          -- Path to archive file/directory
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    session_count INTEGER,
+    output_count INTEGER,
+    screenshot_count INTEGER,
+    embedding_count INTEGER,
+    date_from DATETIME,                  -- Oldest data in archive
+    date_to DATETIME,                    -- Newest data in archive
+    size_bytes INTEGER,
+    compression TEXT,
+    is_restored INTEGER DEFAULT 0
+);
+
+-- Indexes for performance
+CREATE INDEX idx_sessions_status ON sessions(status);
+CREATE INDEX idx_sessions_created ON sessions(created_at);
+CREATE INDEX idx_output_session ON terminal_output(session_id);
+CREATE INDEX idx_output_timestamp ON terminal_output(timestamp);
+CREATE INDEX idx_output_sequence ON terminal_output(session_id, sequence_num);
+CREATE INDEX idx_screenshots_session ON screenshots(session_id);
+CREATE INDEX idx_embeddings_session ON embeddings(session_id);
+
+==============================================================================
+5. API DESIGN
+==============================================================================
+
+5.1 WebSocket Endpoint
+----------------------
+Path: /ws/terminal/{session_id}
+
+Client -> Server Messages:
+{
+    "type": "input",
+    "data": "string"           // Raw terminal input
+}
+
+{
+    "type": "resize",
+    "rows": 24,
+    "cols": 80
+}
+
+{
+    "type": "command",
+    "cmd": "rename",
+    "name": "New Tab Name"
+}
+
+{
+    "type": "command",
+    "cmd": "screenshot_upload",
+    "timestamp": "2024-01-15T10:30:00Z",
+    "data": "base64encoded..."  // PNG/JPEG data
+}
+
+Server -> Client Messages:
+{
+    "type": "output",
+    "data": "string",          // Raw terminal output
+    "seq": 123                 // Sequence number for ordering
+}
+
+{
+    "type": "history_replay",
+    "chunks": [
+        {"seq": 1, "content": "..."},
+        {"seq": 2, "content": "..."}
+    ],
+    "is_complete": true
+}
+
+{
+    "type": "cwd_change",
+    "path": "/home/user/project",
+    "success": false,
+    "error": "despite retries, we could not cd to /old/path: No such file or directory"
+}
+
+{
+    "type": "error",
+    "message": "string"
+}
+
+{
+    "type": "info",
+    "event": "session_restored" | "profile_loaded" | "screenshot_saved"
+}
+
+5.2 REST Endpoints
+------------------
+
+Sessions:
+GET    /api/sessions              List sessions (query: status, limit, offset)
+POST   /api/sessions              Create new session
+                               Body: {profile: "default", name?: "", cwd?: ""}
+GET    /api/sessions/{id}         Get session metadata
+PUT    /api/sessions/{id}         Update session (rename)
+DELETE /api/sessions/{id}         Terminate and optionally delete
+POST   /api/sessions/{id}/restore Restore archived session
+POST   /api/sessions/{id}/archive Manually archive session
+
+Profiles:
+GET    /api/profiles              List available profiles
+GET    /api/profiles/{name}       Get profile details
+
+Search:
+POST   /api/search
+       Body: {
+           query: "git commit",
+           mode: "text" | "semantic" | "both",
+           scope: "all" | "current" | [session_ids],
+           time_from?: "2024-01-01",
+           time_to?: "2024-01-15",
+           limit: 50,
+           include_context: true
+       }
+       Response: [
+           {
+               session_id: "uuid",
+               session_name: "Tab 1",
+               timestamp: "2024-01-15T10:30:00Z",
+               content: "...",
+               context_before: ["..."],
+               context_after: ["..."],
+               match_score: 0.95  // For semantic search
+           }
+       ]
+
+History:
+GET    /api/history/{session_id}  Get session history
+                               Query: from_seq, to_seq, limit
+POST   /api/history/{session_id}/export  Export to file
+
+Screenshots:
+GET    /api/screenshots/{session_id}     List screenshots
+GET    /api/screenshots/{session_id}/{timestamp}  Download image
+
+Admin/Status:
+GET    /api/status                Backend status, enabled modules
+GET    /api/stats                 Usage statistics
+POST   /api/retention/run         Trigger retention job manually
+
+==============================================================================
+6. CORE SERVICE IMPLEMENTATIONS
+==============================================================================
+
+6.1 TerminalManager
+-------------------
+- Manages PTY processes using `pty.openpty()` and `subprocess.Popen()`
+- Maps session_id -> PTY fd + process
+- Async I/O loop using `asyncio` + `loop.add_reader()`
+- Tracks current working directory via periodic `pwd` injection or prompt parsing
+- Routes output to HistoryLogger and WebSocket
+
+6.2 HistoryLogger
+-----------------
+- Receives output chunks from TerminalManager
+- Writes to rolling log file: storage/logs/{session_uuid}.log
+- Inserts to terminal_output table with sequence numbers
+- Updates FTS5 index via trigger or manual sync
+- Batches writes for performance (every N chunks or M seconds)
+
+6.3 ScreenshotHandler
+---------------------
+- Receives base64-encoded images from frontend
+- Validates format, dimensions
+- Saves to storage/screenshots/{session_uuid}/{timestamp}.png
+- Records metadata to database
+- Checks max_per_session limit, deletes oldest if exceeded
+
+6.4 EmbeddingService
+--------------------
+- Only instantiated if enabled in config
+- Loads sentence-transformers model on startup
+- Processes terminal_output chunks in background
+- Generates embeddings, stores in ChromaDB or FAISS
+- Chunking strategy: sliding window with overlap
+- Stores vector_id reference in embeddings table
+
+6.5 SearchEngine
+----------------
+- Text search: Queries terminal_output_fts, joins with terminal_output
+- Semantic search: Embeds query, searches vector store, resolves references
+- Combined search: Merges results with ranking
+- Scope filtering by session_id list or time range
+
+6.6 SessionRecovery
+-------------------
+- Retrieves all terminal_output chunks for session
+- Sends history_replay WebSocket message
+- Attempts to `cd` to last_cwd
+- On failure: sends cwd_change message with error explanation
+- Creates new session entry linked to original
+
+==============================================================================
+7. RETENTION MANAGER - IMPLEMENTATION DETAILS
+==============================================================================
+
+The draft raises important questions about archive implementation:
+
+7.1 Archive Strategy Options
+------------------------------
+
+RING BUFFER APPROACH:
+- Continuously write to archive as data ages out
+- Archive files organized by time periods (daily/weekly/monthly)
+- When size limit hit, delete oldest archive files
+- Pro: Always within size constraints
+- Con: More complex, data split across multiple archives
+
+BATCH ARCHIVE APPROACH:
+- Wait until retention period hit, then archive all at once
+- Archives organized by date range
+- Check total size after each archive, delete old if needed
+- Pro: Simpler, atomic operations
+- Con: Sudden size spikes
+
+RECOMMENDED: Hybrid with monthly batch archives
+
+7.2 Safe Archive Workflow
+-------------------------
+
+To prevent data corruption during archive:
+
+1. Create archive.inprogress/{archive_name}/ directory
+2. Copy all data to archive:
+   - Export DB rows to JSON/CSV
+   - Copy log files
+   - Copy screenshots (optional, can be separate)
+   - Export vector store segment
+3. Compress to archive.inprogress/{archive_name}.{compression}
+4. Validate archive integrity (checksum)
+5. Move validated archive to archive/{YYYY-MM}/{archive_name}.{compression}
+6. Delete source data from live tables
+7. Update archive_manifest table
+8. Remove archive.inprogress directory
+
+On failure at any step: leave inprogress, clean up on next run
+
+7.3 Data Organization in Archives
+---------------------------------
+
+Archive structure (tar.gz or zip):
+archive-2024-01-15-to-2024-01-25.tar.gz
+├── manifest.json           # Metadata, checksums, date range
+├── sessions/
+│   └── {uuid}.json         # Session metadata
+├── terminal_output/
+│   └── {uuid}.log          # Raw terminal logs
+├── screenshots/
+│   └── {uuid}/             # Screenshot images
+└── embeddings/
+    └── {uuid}.json         # Embedding vectors + metadata
+
+manifest.json:
+{
+    "created_at": "2024-01-26T02:00:00Z",
+    "date_from": "2024-01-15T00:00:00Z",
+    "date_to": "2024-01-25T23:59:59Z",
+    "session_count": 15,
+    "total_output_bytes": 10485760,
+    "compression": "gzip",
+    "checksums": {
+        "sessions/{uuid}.json": "sha256:...",
+        ...
+    }
+}
+
+7.4 Database vs File Archive
+----------------------------
+
+For ChromaDB embeddings:
+- Option A: Export collection to JSON, reimport on restore
+- Option B: Copy ChromaDB segment files directly
+- Option C: Store archive in separate ChromaDB collection with archive_ prefix
+
+Recommended: Option A for portability
+
+7.5 Archive Restoration
+-----------------------
+
+1. User requests restore of archived session
+2. Locate archive in archive_manifest
+3. Extract to archive.inprogress/{archive_name}/
+4. Validate checksums
+5. Import sessions table entries
+6. Import terminal_output (or leave in file, reference from DB)
+7. Rebuild FTS5 index for imported content
+8. Regenerate embeddings if semantic search enabled
+9. Update session status to 'inactive' (ready for recovery)
+10. Clean up extracted files
+
+==============================================================================
+8. FRONTEND ARCHITECTURE
+==============================================================================
+
+8.1 Component Structure
+-----------------------
+- App: Main container, manages global state
+- TabBar: List of tabs with rename capability
+- TerminalPanel: xterm.js instance per tab
+- SearchModal: Query input, scope selector, results list
+- RestorePanel: Archived sessions browser
+- ProfileSelector: Dropdown for new tab creation
+
+8.2 State Management
+--------------------
+activeSessions: Map<session_id, {
+    socket: WebSocket,
+    terminal: Terminal,
+    name: string,
+    profile: string,
+    historyBuffer: string[]
+}>
+
+8.3 Screenshot Capture
+----------------------
+- Use xterm.js canvas element
+- setInterval every config.screenshot.interval_seconds
+- canvas.toBlob() -> FileReader -> base64 -> upload via WebSocket
+- Check screenshot count limit before capture
+
+8.4 Search UI Flow
+------------------
+1. User opens search modal
+2. Select scope: current tab / all tabs / specific sessions
+3. Enter query
+4. Submit to /api/search
+5. Display results with context
+6. Click result -> switch tab, replay to that timestamp
+
+==============================================================================
+9. DEPENDENCIES
+==============================================================================
+
+Python Backend:
+- fastapi>=0.104.0          # Web framework
+- uvicorn[standard]>=0.24   # ASGI server
+- sqlalchemy>=2.0           # ORM
+- aiosqlite>=0.19           # Async SQLite
+- python-pty>=0.0.1         # PTY handling
+- pyyaml>=6.0               # Config parsing
+- apscheduler>=3.10         # Scheduled jobs
+- python-multipart>=0.0.6   # File uploads
+- sentence-transformers>=2.2 # Embeddings (optional)
+- chromadb>=0.4             # Vector DB (optional)
+- faiss-cpu>=1.7            # Alternative vector DB (optional)
+
+Frontend:
+- xterm@5.3                 # Terminal emulator
+- xterm-addon-fit@0.8       # Auto-resize
+- xterm-addon-web-links@0.9 # URL highlighting
+- xterm-addon-search@0.13   # In-terminal search
+
+==============================================================================
+10. IMPLEMENTATION PHASES
+==============================================================================
+
+Phase 1: Core Terminal
+- Basic FastAPI setup
+- WebSocket endpoint
+- PTY spawning
+- xterm.js frontend connection
+
+Phase 2: Session Management
+- Multiple tabs
+- Session persistence in DB
+- Profile loading
+- Tab rename
+
+Phase 3: History & Search
+- HistoryLogger service
+- Raw log files
+- Text search with FTS5
+- Search UI
+
+Phase 4: Session Recovery
+- History replay
+- CWD tracking and restoration
+- Recovery error handling
+
+Phase 5: Screenshots
+- Frontend canvas capture
+- Upload and storage
+- Screenshot browser
+
+Phase 6: Semantic Search
+- Embedding service
+- Vector store integration
+- Combined search API
+
+Phase 7: Retention System
+- RetentionManager service
+- Archive workflow
+- Restore functionality
+- Scheduled cleanup jobs
+
+Phase 8: Polish
+- Configuration validation
+- Error handling
+- Authentication (optional)
+- Documentation
+
+==============================================================================
+11. SECURITY CONSIDERATIONS
+==============================================================================
+
+- All endpoints require authentication if enabled
+- Profile commands validated against whitelist
+- Path traversal prevention in file operations
+- WebSocket origin validation
+- Screenshot size limits to prevent DoS
+- Archive extraction path validation
+- SQL injection prevention via SQLAlchemy ORM
+- XSS prevention via output sanitization in search results
+
+==============================================================================
+12. ERROR MESSAGES
+==============================================================================
+
+Session recovery CWD failure:
+"Despite retries, we could not cd to {path}: {error}"
+
+Archive corruption:
+"Archive {path} failed validation, attempting recovery from backup"
+
+Retention cleanup:
+"Removed {count} sessions older than {days} days"
+"Archived {count} sessions ({bytes} bytes) to {archive_path}"

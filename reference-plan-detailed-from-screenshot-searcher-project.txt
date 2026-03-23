@@ -1,0 +1,3515 @@
+# Screenshot Searcher - Detailed Executable Python Plan
+# Dependencies listed at the end of each section
+# =============================================================================
+
+# =============================================================================
+# PROJECT STRUCTURE
+# =============================================================================
+"""
+screenshot_searcher/
+├── config.py              # Configuration settings
+├── database.py            # Database models and operations
+├── workers/
+│   ├── __init__.py
+│   ├── screenshot_worker.py      # Captures screenshots every 1 minute
+│   ├── ocr_worker.py             # OCR with tesseract
+│   ├── embedding_worker.py       # Image embedding generation
+│   ├── cleanup_worker.py         # Removes old screenshots (>7 days)
+│   └── window_title_worker.py    # Collects active window titles
+├── api.py                 # FastAPI web interface
+├── search.py              # BM25 and embedding search
+├── static/                # Web assets
+└── templates/             # HTML templates
+
+DATA DIRECTORY STRUCTURE:
+data/
+├── screenshots/           # Raw screenshots (timestamp_based.png)
+├── ocr/                   # OCR text results (timestamp_based.txt)
+├── embeddings/            # NPY embedding files (timestamp_based.npy)
+└── database.db           # SQLite database
+"""
+
+# =============================================================================
+# SECTION 1: YAML CONFIGURATION (config.yaml)
+# =============================================================================
+
+"""
+# config.yaml - User-editable configuration file
+# Place in working directory or ~/.config/flashback/config.yaml
+
+# Data storage paths
+data_dir: "~/.local/share/flashback"
+
+# Screenshot settings
+screenshot:
+  enabled: true
+  interval_seconds: 60
+  quality: 85
+  formats: ["png"]
+
+# Worker configuration - enable/disable and set intervals
+workers:
+  screenshot:
+    enabled: true
+    # Uses global screenshot.interval_seconds
+
+  ocr:
+    enabled: true
+    work_interval_seconds: 1
+    batch_size: 5
+    languages: ["eng"]  # Tesseract language packs to use
+
+  embedding:
+    enabled: true
+    work_interval_seconds: 1
+    batch_size: 3
+
+    # EMBEDDING MODE
+    # Options: 'text-only', 'image-only', 'text-image-hybrid'
+    # - text-only:    Only indexes text (OCR content). Fast, works with any embedding API.
+    # - image-only:   Only indexes image pixels. Requires vision-capable embedding model.
+    # - text-image-hybrid: Indexes both separately. Slower but most accurate.
+    mode: "text-image-hybrid"
+
+    # TEXT EMBEDDING CONFIG (used in 'text-only' and 'text-image-hybrid' modes)
+    # Any OpenAI-compatible embedding API that supports text input
+    text:
+      base_url: "https://api.openai.com/v1"  # or "http://localhost:11434/v1" for ollama
+      api_key: "${OPENAI_API_KEY}"  # Environment variable substitution
+      model: "text-embedding-3-small"  # Text embedding model
+      dimension: null  # REQUIRED: Run 'flashback config test-embedding --type text --write'
+      extra_headers: {}
+
+    # IMAGE EMBEDDING CONFIG (used in 'image-only' and 'text-image-hybrid' modes)
+    # Requires vision-capable embedding API (supports image inputs)
+    image:
+      base_url: "http://localhost:11434/v1"  # Ollama, llava, etc.
+      api_key: ""  # Often empty for local APIs
+      model: "llava"  # Vision-capable model name
+      dimension: null  # REQUIRED: Run 'flashback config test-embedding --type image --write'
+      extra_headers: {}
+
+    # HYBRID SEARCH WEIGHTS (only used when mode is 'text-image-hybrid')
+    hybrid_weights:
+      text_weight: 0.5   # Weight for text embeddings (0.0-1.0)
+      image_weight: 0.5  # Weight for image embeddings (0.0-1.0)
+      # Reciprocal Rank Fusion k value for merging results
+      rrf_k: 60
+
+  cleanup:
+    enabled: true
+    check_interval_seconds: 3600
+    retention_days: 7
+
+  window_title:
+    enabled: true
+    poll_interval_seconds: 1
+
+# Search configuration
+search:
+  enabled_methods:
+    bm25: true
+    embedding: true
+    image_search: true  # Enable image-to-image search
+
+  bm25:
+    k1: 1.5
+    b: 0.75
+    default_limit: 50
+
+  embedding:
+    default_limit: 50
+
+  # COMPREHENSIVE SEARCH MODES
+  # Defines how different search methods are combined
+  # Each mode can be used via CLI: flashback search --search-mode <mode>
+  # or API: ?search_mode=<mode>
+  search_modes:
+    # 1. TEXT-ONLY MODES (for text queries)
+    bm25_only:
+      description: "BM25 text search only"
+      inputs: [text]
+      methods:
+        bm25: { weight: 1.0 }
+
+    text_embedding_only:
+      description: "Text embedding search only"
+      inputs: [text]
+      methods:
+        text_embedding: { weight: 1.0 }
+
+    text_hybrid:
+      description: "BM25 + text embedding fusion"
+      inputs: [text]
+      methods:
+        bm25: { weight: 0.3 }
+        text_embedding: { weight: 0.7 }
+      fusion: reciprocal_rank  # reciprocal_rank, weighted_sum, or weighted_product
+      rrf_k: 60
+
+    # 2. IMAGE-ONLY MODES (for image queries)
+    image_embedding_only:
+      description: "Image embedding search only"
+      inputs: [image]
+      methods:
+        image_embedding: { weight: 1.0 }
+
+    # 3. CROSS-MODAL MODES (text query -> image search)
+    # Note: Requires vision-language model that can embed text to image space
+    text_to_image:
+      description: "Search images using text query (requires CLIP-like model)"
+      inputs: [text]
+      methods:
+        image_embedding: { weight: 1.0 }
+      # This requires the text encoder and image encoder to be compatible
+      # (same embedding space, e.g., CLIP)
+
+    # 4. MULTI-MODAL QUERY MODES (text + image query)
+    text_and_image:
+      description: "Query with both text and image"
+      inputs: [text, image]
+      methods:
+        text_embedding: { weight: 0.5 }
+        image_embedding: { weight: 0.5 }
+      fusion: reciprocal_rank
+      rrf_k: 60
+
+    # 5. COMPREHENSIVE MODE (all methods)
+    comprehensive:
+      description: "BM25 + text embedding + image embedding (requires image query)"
+      inputs: [text, image]
+      methods:
+        bm25: { weight: 0.2 }
+        text_embedding: { weight: 0.4 }
+        image_embedding: { weight: 0.4 }
+      fusion: reciprocal_rank
+      rrf_k: 60
+
+  # Default search mode when not specified
+  default_search_mode: "text_hybrid"
+
+  # Search behavior settings
+  behavior:
+    # When searching with text, also include image embeddings in results
+    # (requires compatible text/image encoders like CLIP)
+    cross_modal_text_to_image: false
+
+    # Filter results by minimum score threshold
+    min_score_threshold: null  # e.g., 0.5 to filter low-relevance results
+
+    # Boost recent screenshots in results
+    time_decay:
+      enabled: false
+      half_life_days: 7  # Score decays by half after this many days
+
+# Web UI configuration
+webui:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8080
+
+# Feature flags (override based on installed extras)
+features:
+  ocr: auto  # auto, true, or false
+  embedding_search: auto
+  semantic_search: auto
+
+# Validation settings
+validation:
+  # Alert if embedding dimension mismatch detected
+  check_embedding_dimension: true
+  # Stop workers on embedding API error
+  halt_on_embedding_error: false
+"""
+
+# =============================================================================
+# SECTION 2: CONFIGURATION LOADER (config.py)
+# =============================================================================
+
+"""
+# config.py
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+# Base paths
+BASE_DIR = Path(__file__).parent
+USER_CONFIG_DIR = Path.home() / ".config" / "screenshot-searcher"
+USER_CONFIG_PATH = USER_CONFIG_DIR / "config.yaml"
+LOCAL_CONFIG_PATH = BASE_DIR / "config.yaml"
+
+# Default configuration
+DEFAULT_CONFIG = {
+    "data_dir": "~/screenshot-searcher-data",
+    "screenshot": {
+        "enabled": True,
+        "interval_seconds": 60,
+        "quality": 85,
+        "formats": ["png"],
+    },
+    "workers": {
+        "screenshot": {"enabled": True},
+        "ocr": {"enabled": True, "work_interval_seconds": 1, "batch_size": 5, "languages": ["eng"]},
+        "embedding": {
+            "enabled": True,
+            "work_interval_seconds": 1,
+            "batch_size": 3,
+            "mode": "text-image-hybrid",  # text-only, image-only, text-image-hybrid
+            "text": {
+                "base_url": "",
+                "api_key": "",
+                "model": "",
+                "dimension": None,
+                "extra_headers": {},
+            },
+            "image": {
+                "base_url": "",
+                "api_key": "",
+                "model": "",
+                "dimension": None,
+                "extra_headers": {},
+            },
+            "hybrid_weights": {
+                "text_weight": 0.5,
+                "image_weight": 0.5,
+                "rrf_k": 60,
+            },
+        },
+        "cleanup": {"enabled": True, "check_interval_seconds": 3600, "retention_days": 7},
+        "window_title": {"enabled": True, "poll_interval_seconds": 1},
+    },
+    "validation": {
+        "check_embedding_dimension": True,
+        "halt_on_embedding_error": False,
+    },
+    "search": {
+        "enabled_methods": {"bm25": True, "embedding": True, "image_search": True},
+        "bm25": {"k1": 1.5, "b": 0.75, "default_limit": 50},
+        "embedding": {"default_limit": 50},
+        "search_modes": {
+            "bm25_only": {
+                "description": "BM25 text search only",
+                "inputs": ["text"],
+                "methods": {"bm25": {"weight": 1.0}},
+            },
+            "text_embedding_only": {
+                "description": "Text embedding search only",
+                "inputs": ["text"],
+                "methods": {"text_embedding": {"weight": 1.0}},
+            },
+            "text_hybrid": {
+                "description": "BM25 + text embedding fusion",
+                "inputs": ["text"],
+                "methods": {
+                    "bm25": {"weight": 0.3},
+                    "text_embedding": {"weight": 0.7},
+                },
+                "fusion": "reciprocal_rank",
+                "rrf_k": 60,
+            },
+            "image_embedding_only": {
+                "description": "Image embedding search only",
+                "inputs": ["image"],
+                "methods": {"image_embedding": {"weight": 1.0}},
+            },
+            "text_and_image": {
+                "description": "Multi-modal search with both text and image",
+                "inputs": ["text", "image"],
+                "methods": {
+                    "text_embedding": {"weight": 0.5},
+                    "image_embedding": {"weight": 0.5},
+                },
+                "fusion": "reciprocal_rank",
+                "rrf_k": 60,
+            },
+            "comprehensive": {
+                "description": "BM25 + text embedding + image embedding",
+                "inputs": ["text", "image"],
+                "methods": {
+                    "bm25": {"weight": 0.2},
+                    "text_embedding": {"weight": 0.4},
+                    "image_embedding": {"weight": 0.4},
+                },
+                "fusion": "reciprocal_rank",
+                "rrf_k": 60,
+            },
+        },
+        "default_search_mode": "text_hybrid",
+        "behavior": {
+            "cross_modal_text_to_image": False,
+            "min_score_threshold": None,
+            "time_decay": {"enabled": False, "half_life_days": 7},
+        },
+    },
+    "webui": {"enabled": True, "host": "127.0.0.1", "port": 8080},
+    "features": {"ocr": "auto", "embedding_search": "auto", "semantic_search": "auto"},
+}
+
+
+class Config:
+    def __init__(self):
+        self._config = self._load_config()
+        self._validate()
+
+    def _load_config(self) -> Dict[str, Any]:
+        config = DEFAULT_CONFIG.copy()
+
+        if not HAS_YAML:
+            print("[WARN] PyYAML not installed, using default config")
+            print("[INFO] Install with: pip install pyyaml")
+            return config
+
+        # Load from file if exists
+        config_path = None
+        if LOCAL_CONFIG_PATH.exists():
+            config_path = LOCAL_CONFIG_PATH
+        elif USER_CONFIG_PATH.exists():
+            config_path = USER_CONFIG_PATH
+
+        if config_path:
+            with open(config_path) as f:
+                user_config = yaml.safe_load(f)
+                if user_config:
+                    self._deep_merge(config, user_config)
+
+        return config
+
+    def _deep_merge(self, base: Dict, override: Dict):
+        for key, value in override.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._deep_merge(base[key], value)
+            else:
+                base[key] = value
+
+    def _validate(self):
+        # Expand data directory path
+        data_dir = Path(self._config["data_dir"]).expanduser()
+        self._config["data_dir"] = str(data_dir)
+
+        # Create subdirectories
+        self.screenshot_dir = data_dir / "screenshots"
+        self.ocr_dir = data_dir / "ocr"
+        self.embedding_dir = data_dir / "embeddings"
+        self.db_path = data_dir / "database.db"
+
+        for d in [self.screenshot_dir, self.ocr_dir, self.embedding_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Validate embedding configuration
+        self._validate_embedding_config()
+
+    def _validate_embedding_config(self):
+        """Validate embedding configuration based on mode."""
+        if not self.is_worker_enabled("embedding"):
+            return
+
+        mode = self.get("workers.embedding.mode", "text-image-hybrid")
+        valid_modes = ["text-only", "image-only", "text-image-hybrid"]
+
+        if mode not in valid_modes:
+            raise ValueError(
+                f"Invalid embedding mode: '{mode}'. "
+                f"Must be one of: {', '.join(valid_modes)}"
+            )
+
+        # Validate based on mode
+        errors = []
+
+        if mode in ("text-only", "text-image-hybrid"):
+            text_config = self.get("workers.embedding.text", {})
+            if not text_config.get("base_url"):
+                errors.append("workers.embedding.text.base_url is required")
+            if not text_config.get("model"):
+                errors.append("workers.embedding.text.model is required")
+
+        if mode in ("image-only", "text-image-hybrid"):
+            image_config = self.get("workers.embedding.image", {})
+            if not image_config.get("base_url"):
+                errors.append("workers.embedding.image.base_url is required")
+            if not image_config.get("model"):
+                errors.append("workers.embedding.image.model is required")
+
+        if errors:
+            raise ValueError(
+                "Embedding configuration errors:\n  - " + "\n  - ".join(errors)
+            )
+
+    def get_embedding_mode(self) -> str:
+        """Get the configured embedding mode."""
+        return self.get("workers.embedding.mode", "text-image-hybrid")
+
+    def get_text_embedding_config(self) -> Dict[str, Any]:
+        """Get text embedding configuration."""
+        return self.get("workers.embedding.text", {})
+
+    def get_image_embedding_config(self) -> Dict[str, Any]:
+        """Get image embedding configuration."""
+        return self.get("workers.embedding.image", {})
+
+    def needs_text_embedding(self) -> bool:
+        """Check if text embedding is needed based on mode."""
+        mode = self.get_embedding_mode()
+        return mode in ("text-only", "text-image-hybrid")
+
+    def needs_image_embedding(self) -> bool:
+        """Check if image embedding is needed based on mode."""
+        mode = self.get_embedding_mode()
+        return mode in ("image-only", "text-image-hybrid")
+
+    def get(self, key: str, default=None):
+        keys = key.split(".")
+        value = self._config
+        for k in keys:
+            value = value.get(k, default)
+            if value is None:
+                return default
+        return value
+
+    def is_worker_enabled(self, worker_name: str) -> bool:
+        return self.get(f"workers.{worker_name}.enabled", True)
+
+    def is_search_enabled(self, method: str) -> bool:
+        return self.get(f"search.enabled_methods.{method}", True)
+
+    def get_ocr_languages(self) -> List[str]:
+        return self.get("workers.ocr.languages", ["eng"])
+
+    @property
+    def screenshot_interval(self) -> int:
+        return self.get("screenshot.interval_seconds", 60)
+
+    @property
+    def retention_days(self) -> int:
+        return self.get("workers.cleanup.retention_days", 7)
+
+
+# Global config instance
+config = Config()
+"""
+
+# DEPENDENCIES: pyyaml
+
+# =============================================================================
+# SECTION 3: DEPENDENCY CHECKER (deps.py)
+# =============================================================================
+
+"""
+# deps.py - Check for external binary dependencies and provide install help
+import shutil
+import subprocess
+import sys
+from typing import List, Optional, Tuple
+from pathlib import Path
+
+from config import config
+
+
+class DependencyError(Exception):
+    def __init__(self, message: str, install_cmd: str):
+        self.message = message
+        self.install_cmd = install_cmd
+        super().__init__(message)
+
+    def __str__(self):
+        return f"""
+{'='*70}
+DEPENDENCY ERROR: {self.message}
+{'='*70}
+
+To fix this issue, run:
+
+    {self.install_cmd}
+
+{'='*70}
+"""
+
+
+class DependencyChecker:
+    # Maps feature name to (binary_name, ubuntu_package, check_args)
+    BINARY_DEPS = {
+        "tesseract": ("tesseract", "tesseract-ocr", ["--version"]),
+    }
+
+    # Maps language code to tesseract language package
+    TESSERACT_LANGS = {
+        "eng": "tesseract-ocr-eng",
+        "chi_sim": "tesseract-ocr-chi-sim",
+        "chi_tra": "tesseract-ocr-chi-tra",
+        "fra": "tesseract-ocr-fra",
+        "deu": "tesseract-ocr-deu",
+        "spa": "tesseract-ocr-spa",
+        "jpn": "tesseract-ocr-jpn",
+        "kor": "tesseract-ocr-kor",
+        "rus": "tesseract-ocr-rus",
+    }
+
+    @classmethod
+    def check_binary(cls, name: str, raise_error: bool = True) -> bool:
+        binary_name, ubuntu_pkg, check_args = cls.BINARY_DEPS[name]
+
+        if shutil.which(binary_name):
+            return True
+
+        if raise_error:
+            raise DependencyError(
+                f"'{binary_name}' is required but not found in PATH",
+                f"sudo apt-get install {ubuntu_pkg}"
+            )
+        return False
+
+    @classmethod
+    def check_tesseract_langs(cls, languages: List[str]) -> Tuple[List[str], List[str]]:
+        available = []
+        missing = []
+
+        try:
+            # Get installed languages
+            result = subprocess.run(
+                ["tesseract", "--list-langs"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            installed = set(result.stdout.strip().split('\n')[1:])
+        except:
+            return [], languages
+
+        for lang in languages:
+            if lang in installed or lang == "eng" and "osd" in installed:
+                available.append(lang)
+            else:
+                missing.append(lang)
+
+        return available, missing
+
+    @classmethod
+    def get_lang_install_cmd(cls, languages: List[str]) -> str:
+        packages = [cls.TESSERACT_LANGS.get(lang, f"tesseract-ocr-{lang}")
+                    for lang in languages]
+        return f"sudo apt-get install {' '.join(packages)}"
+
+    @classmethod
+    def check_all(cls, skip_optional: bool = False):
+        errors = []
+
+        # Check tesseract if OCR enabled
+        if config.is_worker_enabled("ocr") and not skip_optional:
+            try:
+                cls.check_binary("tesseract")
+                # Check configured languages
+                langs = config.get_ocr_languages()
+                available, missing = cls.check_tesseract_langs(langs)
+                if missing:
+                    install_cmd = cls.get_lang_install_cmd(missing)
+                    print(f"[WARN] Missing OCR languages: {missing}")
+                    print(f"[INFO] Install with: {install_cmd}")
+                    # Continue with available languages
+                    print(f"[INFO] Continuing with available languages: {available}")
+            except DependencyError as e:
+                errors.append(e)
+
+        if errors:
+            for e in errors:
+                print(e, file=sys.stderr)
+            sys.exit(1)
+
+
+def check_python_module(module_name: str, pip_package: Optional[str] = None) -> bool:
+    try:
+        __import__(module_name)
+        return True
+    except ImportError:
+        pkg = pip_package or module_name
+        print(f"[ERROR] Python module '{module_name}' not found")
+        print(f"[INFO] Install with: pip install {pkg}")
+        return False
+"""
+
+# DEPENDENCIES: None (built-in)
+
+# =============================================================================
+# SECTION 5: DATABASE SCHEMA (database.py)
+# =============================================================================
+
+"""
+# database.py
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, List
+import json
+
+@dataclass
+class ScreenshotRecord:
+    id: int
+    timestamp: datetime
+    screenshot_path: str
+    ocr_path: Optional[str]
+    embedding_path: Optional[str]
+    window_title: Optional[str]
+    ocr_text: Optional[str]
+    created_at: datetime
+
+class Database:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.init_db()
+
+    def init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS screenshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    screenshot_path TEXT NOT NULL,
+                    ocr_path TEXT,
+                    embedding_path TEXT,
+                    window_title TEXT,
+                    ocr_text TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    UNIQUE(timestamp)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_timestamp ON screenshots(timestamp)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ocr_text ON screenshots(ocr_text)
+            """)
+            conn.commit()
+
+    def insert_screenshot(self, timestamp: float, screenshot_path: str) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO screenshots (timestamp, screenshot_path) VALUES (?, ?)",
+                (timestamp, screenshot_path)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_ocr(self, timestamp: float, ocr_path: str, ocr_text: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE screenshots SET ocr_path = ?, ocr_text = ? WHERE timestamp = ?",
+                (ocr_path, ocr_text, timestamp)
+            )
+            conn.commit()
+
+    def update_embedding(self, timestamp: float, embedding_path: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE screenshots SET embedding_path = ? WHERE timestamp = ?",
+                (embedding_path, timestamp)
+            )
+            conn.commit()
+
+    def update_window_title(self, timestamp: float, window_title: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE screenshots SET window_title = ? WHERE timestamp = ?",
+                (window_title, timestamp)
+            )
+            conn.commit()
+
+    def get_unprocessed_ocr(self, limit: int = 10) -> List[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT * FROM screenshots WHERE ocr_path IS NULL ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_unprocessed_embeddings(self, limit: int = 10) -> List[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT * FROM screenshots WHERE embedding_path IS NULL AND screenshot_path IS NOT NULL ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_older_than(self, days: int) -> List[dict]:
+        cutoff = datetime.now() - timedelta(days=days)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT * FROM screenshots WHERE timestamp < ?",
+                (cutoff.timestamp(),)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_record(self, timestamp: float):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM screenshots WHERE timestamp = ?", (timestamp,))
+            conn.commit()
+
+    def get_neighbors(self, timestamp: float, window: int = 5) -> List[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                """
+                SELECT * FROM screenshots
+                WHERE timestamp BETWEEN ? AND ?
+                ORDER BY timestamp
+                """,
+                (timestamp - window * 60, timestamp + window * 60)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def search_by_time_range(self, start: float, end: float) -> List[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT * FROM screenshots WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp",
+                (start, end)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_ocr_text(self) -> List[tuple]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT id, ocr_text FROM screenshots WHERE ocr_text IS NOT NULL"
+            )
+            return cursor.fetchall()
+"""
+
+# DEPENDENCIES: sqlite3 (built-in)
+
+# =============================================================================
+# SECTION 6: SCREENSHOT WORKER (workers/screenshot_worker.py)
+# =============================================================================
+
+"""
+# workers/screenshot_worker.py
+import time
+import threading
+from datetime import datetime
+from pathlib import Path
+import mss
+import mss.tools
+from PIL import Image
+
+from config import SCREENSHOT_DIR, SCREENSHOT_INTERVAL, SCREENSHOT_QUALITY
+from database import Database
+from config import DB_PATH
+
+class ScreenshotWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.db = Database(DB_PATH)
+        self.running = True
+        self.sct = mss.mss()
+
+    def run(self):
+        print("[ScreenshotWorker] Started")
+        while self.running:
+            try:
+                self.capture()
+                time.sleep(SCREENSHOT_INTERVAL)
+            except Exception as e:
+                print(f"[ScreenshotWorker] Error: {e}")
+                time.sleep(5)
+
+    def capture(self):
+        timestamp = datetime.now()
+        timestamp_float = timestamp.timestamp()
+        filename = timestamp.strftime("%Y%m%d_%H%M%S.png")
+        filepath = SCREENSHOT_DIR / filename
+
+        # Capture screenshot
+        monitor = self.sct.monitors[1]  # Primary monitor
+        screenshot = self.sct.grab(monitor)
+
+        # Save with compression
+        img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+        img.save(filepath, "PNG", optimize=True, quality=SCREENSHOT_QUALITY)
+
+        # Record in database
+        self.db.insert_screenshot(timestamp_float, str(filepath))
+        print(f"[ScreenshotWorker] Captured: {filename}")
+
+    def stop(self):
+        self.running = False
+        self.sct.close()
+
+# Size estimate: 1920x1080 PNG at quality 85 = ~150-300 KB per screenshot
+# Daily: ~250 KB * 1440 (minutes) = ~360 MB per day
+# Weekly: ~2.5 GB
+"""
+
+# DEPENDENCIES: mss, Pillow (PIL)
+
+# =============================================================================
+# SECTION 7: OCR WORKER (workers/ocr_worker.py)
+# =============================================================================
+
+"""
+# workers/ocr_worker.py
+import time
+import threading
+from pathlib import Path
+import pytesseract
+from PIL import Image
+
+from config import OCR_DIR, WORKER_SLEEP_INTERVAL
+from database import Database
+from config import DB_PATH
+
+class OCRWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.db = Database(DB_PATH)
+        self.running = True
+
+    def run(self):
+        print("[OCRWorker] Started")
+        while self.running:
+            try:
+                # Get latest unprocessed screenshots
+                records = self.db.get_unprocessed_ocr(limit=5)
+
+                if not records:
+                    time.sleep(WORKER_SLEEP_INTERVAL)
+                    continue
+
+                for record in records:
+                    self.process(record)
+
+            except Exception as e:
+                print(f"[OCRWorker] Error: {e}")
+                time.sleep(5)
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.db = Database(DB_PATH)
+        self.running = True
+        from config import config
+        self.config = config
+        self.languages = '+'.join(config.get_ocr_languages())
+
+    def process(self, record: dict):
+        screenshot_path = record['screenshot_path']
+        timestamp = record['timestamp']
+
+        try:
+            # Perform OCR with configured languages
+            image = Image.open(screenshot_path)
+            text = pytesseract.image_to_string(image, lang=self.languages)
+
+            # Save OCR result
+            ocr_filename = Path(screenshot_path).stem + ".txt"
+            ocr_path = OCR_DIR / ocr_filename
+            ocr_path.write_text(text, encoding='utf-8')
+
+            # Update database
+            self.db.update_ocr(timestamp, str(ocr_path), text)
+            print(f"[OCRWorker] Processed: {ocr_filename}")
+
+        except Exception as e:
+            print(f"[OCRWorker] Failed to process {screenshot_path}: {e}")
+
+    def stop(self):
+        self.running = False
+"""
+
+# DEPENDENCIES: pytesseract, Pillow (PIL)
+# SYSTEM DEPENDENCY: tesseract-ocr (apt install tesseract-ocr)
+
+# =============================================================================
+# SECTION 8: EMBEDDING WORKER (workers/embedding_worker.py)
+# =============================================================================
+
+"""
+# workers/embedding_worker.py
+import time
+import threading
+from pathlib import Path
+import numpy as np
+import requests
+import base64
+from io import BytesIO
+from PIL import Image
+
+from config import EMBEDDING_DIR, WORKER_SLEEP_INTERVAL
+from database import Database
+from config import DB_PATH, Config
+
+
+class EmbeddingAPIClient:
+    """Client for a single embedding API endpoint."""
+
+    def __init__(self, api_config: dict, name: str):
+        self.api_config = api_config
+        self.name = name  # "text" or "image"
+        self.session = requests.Session()
+        self.dimension = api_config.get("dimension")\n    def _get_api_key(self) -> str:
+        """Get API key from config (supports env variable substitution)."""
+        api_key = self.api_config.get("api_key", "")
+        if api_key.startswith("${") and api_key.endswith("}"):
+            env_var = api_key[2:-1]
+            import os
+            api_key = os.environ.get(env_var, "")
+        return api_key
+
+    def _make_request(self, payload: dict) -> np.ndarray:
+        """Make API request and return embedding vector."""
+        base_url = self.api_config["base_url"].rstrip("/")
+        url = f"{base_url}/embeddings"
+
+        headers = {"Content-Type": "application/json"}
+        api_key = self._get_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        headers.update(self.api_config.get("extra_headers", {}))
+
+        response = self.session.post(url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+
+        data = response.json()
+        embedding = data["data"][0]["embedding"]
+
+        # Validate dimension
+        if self.dimension and len(embedding) != self.dimension:
+            raise RuntimeError(
+                f"[{self.name}] Dimension mismatch: expected {self.dimension}, "
+                f"got {len(embedding)}"
+            )
+
+        return np.array(embedding, dtype=np.float32)
+
+    def get_text_embedding(self, text: str) -> np.ndarray:
+        """Get embedding for text."""
+        payload = {
+            "model": self.api_config["model"],
+            "input": text
+        }
+        return self._make_request(payload)
+
+    def get_image_embedding(self, image: Image.Image) -> np.ndarray:
+        """Get embedding for image (base64 encoded)."""
+        # Encode image to base64
+        buffered = BytesIO()
+        # Resize if too large
+        max_size = 1024
+        if max(image.size) > max_size:
+            ratio = max_size / max(image.size)
+            new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+            image = image.resize(new_size, Image.LANCZOS)
+        image.save(buffered, format="PNG")
+        image_b64 = base64.b64encode(buffered.getvalue()).decode()
+
+        payload = {
+            "model": self.api_config["model"],
+            "input": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}
+                }
+            ]
+        }
+        return self._make_request(payload)
+
+
+class EmbeddingWorker(threading.Thread):
+    """Worker that generates embeddings based on configured mode."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.db = Database(DB_PATH)
+        self.running = True
+        self.config = Config()
+
+        # Get mode and validate
+        self.mode = self.config.get_embedding_mode()
+        self.text_client = None
+        self.image_client = None
+
+        # Initialize clients based on mode
+        if self.config.needs_text_embedding():
+            text_config = self.config.get_text_embedding_config()
+            self.text_client = EmbeddingAPIClient(text_config, "text")
+
+        if self.config.needs_image_embedding():
+            image_config = self.config.get_image_embedding_config()
+            self.image_client = EmbeddingAPIClient(image_config, "image")
+
+    def run(self):
+        print(f"[EmbeddingWorker] Started (mode: {self.mode})")
+        if self.text_client:
+            cfg = self.config.get_text_embedding_config()
+            print(f"[EmbeddingWorker] Text API: {cfg['base_url']} (dim: {cfg.get('dimension')})")
+        if self.image_client:
+            cfg = self.config.get_image_embedding_config()
+            print(f"[EmbeddingWorker] Image API: {cfg['base_url']} (dim: {cfg.get('dimension')})")
+
+        while self.running:
+            try:
+                records = self.db.get_unprocessed_embeddings(limit=3)
+
+                if not records:
+                    time.sleep(WORKER_SLEEP_INTERVAL)
+                    continue
+
+                for record in records:
+                    self.process(record)
+
+            except Exception as e:
+                print(f"[EmbeddingWorker] Error: {e}")
+                time.sleep(5)
+
+    def process(self, record: dict):
+        screenshot_path = record['screenshot_path']
+        timestamp = record['timestamp']
+        ocr_text = record.get('ocr_text', '')
+
+        try:
+            embeddings = {}
+
+            # Generate text embedding if needed
+            if self.text_client and ocr_text:
+                embeddings['text'] = self.text_client.get_text_embedding(ocr_text)
+
+            # Generate image embedding if needed
+            if self.image_client:
+                image = Image.open(screenshot_path)
+                embeddings['image'] = self.image_client.get_image_embedding(image)
+
+            # Save embeddings - filename encodes which types are included
+            base_name = Path(screenshot_path).stem
+            if self.mode == "text-image-hybrid":
+                # Save both separately
+                if 'text' in embeddings:
+                    np.save(EMBEDDING_DIR / f"{base_name}.text.npy", embeddings['text'])
+                if 'image' in embeddings:
+                    np.save(EMBEDDING_DIR / f"{base_name}.image.npy", embeddings['image'])
+                # Create marker file indicating both exist
+                (EMBEDDING_DIR / f"{base_name}.hybrid").touch()
+            else:
+                # Single embedding file
+                key = 'text' if self.mode == 'text-only' else 'image'
+                np.save(EMBEDDING_DIR / f"{base_name}.npy", embeddings[key])
+
+            # Update database
+            self.db.update_embedding(timestamp, str(EMBEDDING_DIR / base_name))
+            print(f"[EmbeddingWorker] Processed: {base_name} ({self.mode})")
+
+        except Exception as e:
+            print(f"[EmbeddingWorker] Failed to process {screenshot_path}: {e}")
+
+            if self.config.get("validation.halt_on_embedding_error", False):
+                raise
+
+    def stop(self):
+        self.running = False
+        if self.text_client:
+            self.text_client.session.close()
+        if self.image_client:
+            self.image_client.session.close()
+"""
+
+# DEPENDENCIES: requests, numpy, Pillow (PIL)
+# No local ML models required - embeddings are computed via API
+
+# =============================================================================
+# SECTION 9: CLEANUP WORKER (workers/cleanup_worker.py)
+# =============================================================================
+
+"""
+# workers/cleanup_worker.py
+import time
+import threading
+from pathlib import Path
+import os
+
+from config import RETENTION_DAYS, DB_PRUNE_INTERVAL, SCREENSHOT_DIR, OCR_DIR, EMBEDDING_DIR
+from database import Database
+from config import DB_PATH
+
+class CleanupWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.db = Database(DB_PATH)
+        self.running = True
+
+    def run(self):
+        print("[CleanupWorker] Started")
+        while self.running:
+            try:
+                self.cleanup()
+                time.sleep(DB_PRUNE_INTERVAL)
+            except Exception as e:
+                print(f"[CleanupWorker] Error: {e}")
+                time.sleep(300)
+
+    def cleanup(self):
+        print("[CleanupWorker] Running cleanup...")
+        old_records = self.db.get_older_than(RETENTION_DAYS)
+
+        for record in old_records:
+            try:
+                # Delete files
+                for key in ['screenshot_path', 'ocr_path', 'embedding_path']:
+                    if record.get(key):
+                        path = Path(record[key])
+                        if path.exists():
+                            os.remove(path)
+                            print(f"[CleanupWorker] Deleted: {path}")
+
+                # Delete database record
+                self.db.delete_record(record['timestamp'])
+
+            except Exception as e:
+                print(f"[CleanupWorker] Failed to delete record {record['timestamp']}: {e}")
+
+        print(f"[CleanupWorker] Cleaned {len(old_records)} old records")
+
+    def stop(self):
+        self.running = False
+"""
+
+# DEPENDENCIES: os, pathlib (built-in)
+
+# =============================================================================
+# SECTION 10: WINDOW TITLE WORKER (workers/window_title_worker.py)
+# =============================================================================
+
+"""
+# workers/window_title_worker.py
+import time
+import threading
+from datetime import datetime
+
+from config import WORKER_SLEEP_INTERVAL
+from database import Database
+from config import DB_PATH
+
+try:
+    # Linux/X11
+    import Xlib.display
+    HAS_XLIB = True
+except ImportError:
+    HAS_XLIB = False
+
+try:
+    # Windows
+    import pygetwindow
+    HAS_PYGETWINDOW = True
+except ImportError:
+    HAS_PYGETWINDOW = False
+
+class WindowTitleWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.db = Database(DB_PATH)
+        self.running = True
+        self.last_window_title = None
+
+    def run(self):
+        print("[WindowTitleWorker] Started")
+        while self.running:
+            try:
+                title = self.get_active_window_title()
+                if title and title != self.last_window_title:
+                    self.last_window_title = title
+                    # Update most recent screenshot with window title
+                    timestamp = datetime.now().timestamp()
+                    self.db.update_window_title(timestamp, title)
+                    print(f"[WindowTitleWorker] Window: {title[:50]}...")
+
+                time.sleep(WORKER_SLEEP_INTERVAL)
+            except Exception as e:
+                print(f"[WindowTitleWorker] Error: {e}")
+                time.sleep(5)
+
+    def get_active_window_title(self) -> str:
+        if HAS_XLIB:
+            return self._get_x11_window_title()
+        elif HAS_PYGETWINDOW:
+            return self._get_windows_window_title()
+        return "Unknown"
+
+    def _get_x11_window_title(self) -> str:
+        try:
+            display = Xlib.display.Display()
+            window = display.get_input_focus().focus
+            if window:
+                return window.get_wm_name() or "Unknown"
+        except:
+            pass
+        return "Unknown"
+
+    def _get_windows_window_title(self) -> str:
+        try:
+            window = pygetwindow.getActiveWindow()
+            return window.title if window else "Unknown"
+        except:
+            return "Unknown"
+
+    def stop(self):
+        self.running = False
+"""
+
+# DEPENDENCIES (Linux): python-xlib
+# DEPENDENCIES (Windows): pygetwindow, pywin32
+
+# =============================================================================
+# SECTION 11: SEARCH MODULE (search.py)
+# =============================================================================
+
+"""
+# search.py
+from typing import List, Tuple
+import numpy as np
+from pathlib import Path
+import math
+from collections import defaultdict
+
+try:
+    import nltk
+    from nltk.tokenize import word_tokenize
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
+    import re
+
+from config import BM25_K1, BM25_B
+from database import Database
+from config import DB_PATH
+
+class BM25Search:
+    def __init__(self):
+        self.db = Database(DB_PATH)
+        self.k1 = BM25_K1
+        self.b = BM25_B
+        self.doc_lengths = {}
+        self.avg_dl = 0
+        self.doc_freqs = defaultdict(int)
+        self.inverted_index = defaultdict(list)
+        self.N = 0
+        self._build_index()
+
+    def _tokenize(self, text: str) -> List[str]:
+        if NLTK_AVAILABLE:
+            return word_tokenize(text.lower())
+        return re.findall(r'\b\w+\b', text.lower())
+
+    def _build_index(self):
+        records = self.db.get_all_ocr_text()
+        total_length = 0
+
+        for doc_id, text in records:
+            if not text:
+                continue
+
+            tokens = self._tokenize(text)
+            self.doc_lengths[doc_id] = len(tokens)
+            total_length += len(tokens)
+
+            # Build inverted index
+            term_counts = defaultdict(int)
+            for token in tokens:
+                term_counts[token] += 1
+
+            for term, freq in term_counts.items():
+                self.inverted_index[term].append((doc_id, freq))
+                self.doc_freqs[term] += 1
+
+        self.N = len(self.doc_lengths)
+        self.avg_dl = total_length / self.N if self.N > 0 else 0
+
+    def search(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
+        query_terms = self._tokenize(query)
+        scores = defaultdict(float)
+
+        for term in query_terms:
+            if term not in self.inverted_index:
+                continue
+
+            df = self.doc_freqs[term]
+            idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1)
+
+            for doc_id, tf in self.inverted_index[term]:
+                dl = self.doc_lengths[doc_id]
+                denom = self.k1 * (1 - self.b + self.b * (dl / self.avg_dl)) + tf
+                score = idf * (tf * (self.k1 + 1)) / denom
+                scores[doc_id] += score
+
+        results = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return results[:top_k]
+
+class EmbeddingClient:
+    """Client for OpenAI-compatible embedding API."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.api_config = config.get("workers.embedding.api", {})
+        self.session = requests.Session()
+        self.dimension = self.api_config.get("dimension")
+
+    def _get_api_key(self) -> str:
+        """Get API key from config (supports env variable substitution)."""
+        api_key = self.api_config.get("api_key", "")
+        if api_key.startswith("${") and api_key.endswith("}"):
+            env_var = api_key[2:-1]
+            import os
+            api_key = os.environ.get(env_var, "")
+        return api_key
+
+    def get_text_embedding(self, text: str) -> np.ndarray:
+        """Get embedding for text query via API."""
+        base_url = self.api_config.get("base_url", "").rstrip("/")
+        url = f"{base_url}/embeddings"
+
+        headers = {"Content-Type": "application/json"}
+        api_key = self._get_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        headers.update(self.api_config.get("extra_headers", {}))
+
+        payload = {
+            "model": self.api_config.get("model"),
+            "input": text
+        }
+
+        response = self.session.post(url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+
+        data = response.json()
+        embedding = data["data"][0]["embedding"]
+
+        return np.array(embedding, dtype=np.float32)
+
+    def validate_dimension(self) -> int:
+        """Test API and return actual dimension."""
+        test_embedding = self.get_text_embedding("test")
+        return len(test_embedding)
+
+
+class TextEmbeddingSearch:
+    """Search using text embeddings (OCR content)."""
+
+    def __init__(self, config: Config = None, db: Database = None):
+        self.config = config or Config()
+        self.db = db or Database(self.config.db_path)
+        self.client = EmbeddingClient(
+            self.config.get_text_embedding_config(),
+            "text"
+        )
+        self.dimension = self.config.get("workers.embedding.text.dimension")
+
+        if not self.dimension:
+            raise RuntimeError(
+                "Text embedding dimension not configured. "
+                "Run 'flashback config test-embedding --type text' to detect dimension."
+            )
+
+    def search(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
+        query_embedding = self.client.get_text_embedding(query)
+        return self._search_by_vector(query_embedding, top_k, ".text.npy")
+
+    def _search_by_vector(self, query_vec: np.ndarray, top_k: int, suffix: str) -> List[Tuple[int, float]]:
+        records = self.db.get_unprocessed_embeddings(limit=10000)
+        scores = []
+        query_norm = np.linalg.norm(query_vec)
+
+        for record in records:
+            if not record.embedding_path:
+                continue
+
+            try:
+                emb_path = Path(record.embedding_path)
+                # For hybrid mode, look for .text.npy file
+                if suffix:
+                    emb_path = emb_path.with_suffix(suffix)
+
+                if not emb_path.exists():
+                    continue
+
+                emb = np.load(emb_path)
+                if len(emb) != self.dimension:
+                    continue
+
+                similarity = np.dot(query_vec, emb) / (query_norm * np.linalg.norm(emb))
+                scores.append((record.id, float(similarity)))
+            except Exception as e:
+                continue
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+
+class ImageEmbeddingSearch:
+    """Search using image embeddings (visual similarity)."""
+
+    def __init__(self, config: Config = None, db: Database = None):
+        self.config = config or Config()
+        self.db = db or Database(self.config.db_path)
+        self.client = EmbeddingClient(
+            self.config.get_image_embedding_config(),
+            "image"
+        )
+        self.dimension = self.config.get("workers.embedding.image.dimension")
+
+        if not self.dimension:
+            raise RuntimeError(
+                "Image embedding dimension not configured. "
+                "Run 'flashback config test-embedding --type image' to detect dimension."
+            )
+
+    def search_by_image(self, image_path: str, top_k: int = 20) -> List[Tuple[int, float]]:
+        """Search for screenshots similar to an image file."""
+        from PIL import Image
+        image = Image.open(image_path)
+        query_embedding = self.client.get_image_embedding(image)
+        return self._search_by_vector(query_embedding, top_k)
+
+    def search(self, top_k: int = 20) -> List[Tuple[int, float]]:
+        """Generic search - requires image input via search_by_image."""
+        raise NotImplementedError("Use search_by_image() with an image path")
+
+    def _search_by_vector(self, query_vec: np.ndarray, top_k: int) -> List[Tuple[int, float]]:
+        records = self.db.get_unprocessed_embeddings(limit=10000)
+        scores = []
+        query_norm = np.linalg.norm(query_vec)
+
+        for record in records:
+            if not record.embedding_path:
+                continue
+
+            try:
+                emb_path = Path(record.embedding_path)
+                # For hybrid mode, look for .image.npy file
+                if emb_path.with_suffix(".image.npy").exists():
+                    emb_path = emb_path.with_suffix(".image.npy")
+                elif not emb_path.exists():
+                    continue
+
+                emb = np.load(emb_path)
+                if len(emb) != self.dimension:
+                    continue
+
+                similarity = np.dot(query_vec, emb) / (query_norm * np.linalg.norm(emb))
+                scores.append((record.id, float(similarity)))
+            except Exception as e:
+                continue
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+
+class HybridEmbeddingSearch:
+    """Hybrid search combining text and image embeddings."""
+
+    def __init__(self, config: Config = None, db: Database = None):
+        self.config = config or Config()
+        self.db = db or Database(self.config.db_path)
+        self.text_search = TextEmbeddingSearch(config, db)
+        self.image_search = ImageEmbeddingSearch(config, db)
+        self.weights = self.config.get("workers.embedding.hybrid_weights", {})
+
+    def search_by_text(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
+        """Search using text query (searches both text and image embeddings)."""
+        # In hybrid mode, text query searches both modalities
+        text_results = self.text_search.search(query, top_k=top_k * 2)
+
+        # For image search with text query, we'd need a model that can do cross-modal
+        # For now, we only search text embeddings when querying with text
+        return text_results
+
+    def search_by_image(self, image_path: str, top_k: int = 20) -> List[Tuple[int, float]]:
+        """Search for screenshots similar to an image file."""
+        return self.image_search.search_by_image(image_path, top_k)
+
+    def search_fused(self, text_query: str = None, image_path: str = None,
+                     top_k: int = 20) -> List[Tuple[int, float]]:
+        """Fuse results from text and/or image queries using RRF."""
+        from search.fusion import reciprocal_rank_fusion
+
+        results_list = []
+
+        if text_query:
+            text_results = self.text_search.search(text_query, top_k=top_k * 2)
+            results_list.append(text_results)
+
+        if image_path:
+            image_results = self.image_search.search_by_image(image_path, top_k=top_k * 2)
+            results_list.append(image_results)
+
+        if not results_list:
+            return []
+
+        if len(results_list) == 1:
+            return results_list[0][:top_k]
+
+        # Merge using RRF
+        k = self.weights.get("rrf_k", 60)
+        return reciprocal_rank_fusion(*results_list, k=k, top_k=top_k)
+"""
+
+# DEPENDENCIES: numpy, requests, nltk (optional)
+# NLTK DATA: Run `python -m nltk.downloader punkt` for tokenization
+
+# =============================================================================
+# SECTION 12: API / WEB INTERFACE (api.py)
+# =============================================================================
+
+"""
+# api.py
+from fastapi import FastAPI, Request, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from datetime import datetime, timedelta
+from typing import Optional, List
+from pathlib import Path
+import uvicorn
+
+from config import API_HOST, API_PORT, BASE_DIR, DATA_DIR
+from database import Database
+from search import BM25Search, EmbeddingSearch
+from config import DB_PATH
+
+app = FastAPI(title="Screenshot Searcher")
+
+# Static files and templates
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# Initialize search engines based on config
+from config import config
+bm25_search = BM25Search() if config.is_search_enabled("bm25") else None
+embedding_search = None
+try:
+    if config.is_search_enabled("embedding"):
+        embedding_search = EmbeddingSearch()
+except ImportError:
+    print("[WARN] Embedding search configured but API not accessible")
+    print("[INFO] Check workers.embedding.api configuration")
+db = Database(DB_PATH)
+
+@app.get("/")
+async def index(request: Request):
+    from config import config
+    search_methods = []
+    if config.is_search_enabled("bm25"):
+        search_methods.append({"id": "bm25", "name": "BM25 Text", "default": True})
+    if config.is_search_enabled("embedding"):
+        default = not config.is_search_enabled("bm25")
+        search_methods.append({"id": "embedding", "name": "Embedding (Semantic)", "default": default})
+    return templates.TemplateResponse("index.html", {"request": request, "search_methods": search_methods})
+
+@app.get("/api/search")
+async def search(
+    q: str = Query(..., description="Search query"),
+    mode: str = Query("bm25", description="bm25 or embedding"),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 20
+):
+    from config import config
+
+    # Check if search method is enabled
+    if mode == "embedding" and not config.is_search_enabled("embedding"):
+        return {"error": "Embedding search is not enabled"}, 400
+    if mode == "bm25" and not config.is_search_enabled("bm25"):
+        return {"error": "BM25 search is not enabled"}, 400
+
+    # Time range filtering
+    start_ts = None
+    end_ts = None
+    if start_date:
+        start_ts = datetime.fromisoformat(start_date).timestamp()
+    if end_date:
+        end_ts = datetime.fromisoformat(end_date).timestamp()
+
+    # Perform search
+    if mode == "embedding":
+        if embedding_search is None:
+            return {"error": "Embedding search not available - install dependencies"}, 503
+        results = embedding_search.search_by_text(q, top_k=limit)
+    else:
+        if bm25_search is None:
+            return {"error": "BM25 search not available"}, 503
+        results = bm25_search.search(q, top_k=limit)
+
+    # Fetch full records
+    records = []
+    for doc_id, score in results:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM screenshots WHERE id = ?", (doc_id,)
+            ).fetchone()
+
+        if row:
+            record = dict(row)
+            # Filter by time range if specified
+            if start_ts and record['timestamp'] < start_ts:
+                continue
+            if end_ts and record['timestamp'] > end_ts:
+                continue
+
+            record['score'] = score
+            record['timestamp_formatted'] = datetime.fromtimestamp(record['timestamp']).isoformat()
+            records.append(record)
+
+    return {"results": records, "query": q, "mode": mode}
+
+@app.get("/api/neighbors/{timestamp}")
+async def get_neighbors(timestamp: float, window: int = 5):
+    records = db.get_neighbors(timestamp, window)
+
+    # Load full details
+    detailed = []
+    for record in records:
+        item = dict(record)
+        item['timestamp_formatted'] = datetime.fromtimestamp(item['timestamp']).isoformat()
+
+        # Load OCR text if available
+        if item.get('ocr_path') and Path(item['ocr_path']).exists():
+            item['ocr_preview'] = Path(item['ocr_path']).read_text(encoding='utf-8')[:500]
+
+        detailed.append(item)
+
+    return {"center": timestamp, "neighbors": detailed}
+
+@app.get("/api/detail/{timestamp}")
+async def get_detail(timestamp: float):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM screenshots WHERE timestamp = ?", (timestamp,)
+        ).fetchone()
+
+    if not row:
+        return {"error": "Not found"}, 404
+
+    record = dict(row)
+    record['timestamp_formatted'] = datetime.fromtimestamp(record['timestamp']).isoformat()
+
+    # Load full OCR text
+    if record.get('ocr_path') and Path(record['ocr_path']).exists():
+        record['ocr_full'] = Path(record['ocr_path']).read_text(encoding='utf-8')
+
+    return record
+
+if __name__ == "__main__":
+    uvicorn.run(app, host=API_HOST, port=API_PORT)
+"""
+
+# DEPENDENCIES: fastapi, uvicorn, jinja2, aiofiles (optional for async file serving)
+
+# =============================================================================
+# SECTION 4: EMBEDDING VALIDATION SCRIPT (scripts/test_embedding.py)
+# =============================================================================
+
+"""
+# scripts/test_embedding.py - Standalone script to test embedding API
+
+#!/usr/bin/env python3
+"""Test embedding API configuration and detect dimension."""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Add parent to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from flashback.core.config import Config
+from flashback.search.embedding import EmbeddingClient
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Test embedding API configuration")
+    parser.add_argument("--write", "-w", action="store_true",
+                        help="Write detected dimension to config file")
+    parser.add_argument("--config", "-c", type=Path,
+                        help="Path to config file")
+    args = parser.parse_args()
+
+    config = Config(config_path=args.config)
+    api_config = config.get("workers.embedding.api", {})
+
+    print("Testing embedding API configuration...")
+    print(f"Base URL: {api_config.get('base_url', 'NOT SET')}")
+    print(f"Model: {api_config.get('model', 'NOT SET')}")
+
+    if not api_config.get("base_url"):
+        print("\nERROR: base_url not configured!")
+        print("Set workers.embedding.api.base_url in config.yaml")
+        sys.exit(1)
+
+    if not api_config.get("model"):
+        print("\nERROR: model not configured!")
+        print("Set workers.embedding.api.model in config.yaml")
+        sys.exit(1)
+
+    try:
+        client = EmbeddingClient(config)
+        dimension = client.validate_dimension()
+
+        print(f"\n✓ API connection successful!")
+        print(f"✓ Detected dimension: {dimension}")
+
+        current_dim = api_config.get("dimension")
+        if current_dim is None:
+            print("\nNOTE: dimension not set in config")
+        elif current_dim != dimension:
+            print(f"\nWARNING: Configured dimension ({current_dim}) doesn't match detected ({dimension})")
+
+        if args.write:
+            config.set("workers.embedding.api.dimension", dimension)
+            config.save()
+            print(f"\n✓ Wrote dimension {dimension} to config file")
+
+        return 0
+
+    except Exception as e:
+        print(f"\n✗ API test failed: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""
+
+# =============================================================================
+# SECTION 13: MAIN ENTRY POINT (main.py)
+# =============================================================================
+
+"""
+# main.py - Entry point with dependency checking and feature flags
+import signal
+import sys
+import time
+from pathlib import Path
+
+from config import config
+from deps import DependencyChecker, check_python_module
+
+# Import workers conditionally based on config
+workers = []
+
+def import_workers():
+    global workers
+
+    # Screenshot worker (always required)
+    if config.is_worker_enabled("screenshot"):
+        from workers.screenshot_worker import ScreenshotWorker
+        workers.append(ScreenshotWorker())
+
+    # OCR worker (optional)
+    if config.is_worker_enabled("ocr"):
+        if not check_python_module("pytesseract"):
+            print("[ERROR] OCR worker enabled but pytesseract not installed")
+            print("[INFO] Install with: pip install pytesseract")
+            print("[INFO] Or disable in config: workers.ocr.enabled = false")
+            sys.exit(1)
+        from workers.ocr_worker import OCRWorker
+        workers.append(OCRWorker())
+
+    # Embedding worker (optional)
+    if config.is_worker_enabled("embedding"):
+        api_config = config.get("workers.embedding.api", {})
+        if not api_config.get("base_url"):
+            print("[ERROR] Embedding worker enabled but API not configured")
+            print("[INFO] Set workers.embedding.api.base_url in config.yaml")
+            print("[INFO] Or disable in config: workers.embedding.enabled = false")
+            sys.exit(1)
+        if not api_config.get("dimension"):
+            print("[ERROR] Embedding dimension not configured")
+            print("[INFO] Run: flashback config test-embedding --write")
+            sys.exit(1)
+        from workers.embedding_worker import EmbeddingWorker
+        workers.append(EmbeddingWorker())
+
+    # Cleanup worker (always recommended)
+    if config.is_worker_enabled("cleanup"):
+        from workers.cleanup_worker import CleanupWorker
+        workers.append(CleanupWorker())
+
+    # Window title worker (optional)
+    if config.is_worker_enabled("window_title"):
+        from workers.window_title_worker import WindowTitleWorker
+        workers.append(WindowTitleWorker())
+
+
+class Application:
+    def __init__(self):
+        self.running = True
+
+    def start(self):
+        print("="*60)
+        print("Screenshot Searcher - Starting Workers")
+        print("="*60)
+
+        # Check binary dependencies
+        try:
+            DependencyChecker.check_all(skip_optional=False)
+        except SystemExit:
+            sys.exit(1)
+
+        # Import and start workers based on config
+        import_workers()
+
+        if not workers:
+            print("[ERROR] No workers enabled! Check config.yaml")
+            sys.exit(1)
+
+        print(f"\nStarting {len(workers)} worker(s)...")
+        for worker in workers:
+            worker.start()
+
+        print("\nAll workers started. Press Ctrl+C to stop.\n")
+
+        # Keep main thread alive
+        while self.running:
+            time.sleep(1)
+
+    def stop(self, signum, frame):
+        print("\n\nStopping workers...")
+        self.running = False
+
+        for worker in workers:
+            worker.stop()
+            worker.join(timeout=5)
+
+        print("Shutdown complete.")
+        sys.exit(0)
+
+
+def main():
+    app = Application()
+    signal.signal(signal.SIGINT, app.stop)
+    signal.signal(signal.SIGTERM, app.stop)
+    app.start()
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+# DEPENDENCIES: signal, sys, time (built-in)
+
+# =============================================================================
+# SECTION 14: HTML TEMPLATE (templates/index.html)
+# =============================================================================
+
+"""
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Screenshot Searcher</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, sans-serif; background: #1a1a1a; color: #eee; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        h1 { margin-bottom: 20px; }
+        .search-box { display: flex; gap: 10px; margin-bottom: 20px; }
+        input[type="text"] { flex: 1; padding: 10px; font-size: 16px; }
+        select { padding: 10px; }
+        button { padding: 10px 20px; cursor: pointer; }
+        .time-filter { display: flex; gap: 10px; margin-bottom: 20px; }
+        .results { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+        .result-card { background: #2a2a2a; border-radius: 8px; overflow: hidden; cursor: pointer; }
+        .result-card img { width: 100%; height: 180px; object-fit: cover; }
+        .result-card .info { padding: 15px; }
+        .result-card .time { color: #888; font-size: 12px; }
+        .result-card .window { color: #4a9; font-size: 12px; }
+        .result-card .ocr { color: #aaa; font-size: 11px; margin-top: 8px; max-height: 60px; overflow: hidden; }
+        .detail-modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); z-index: 100; overflow: auto; }
+        .detail-content { max-width: 1200px; margin: 40px auto; padding: 20px; }
+        .detail-content img { max-width: 100%; border-radius: 8px; }
+        .neighbors { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 20px; }
+        .neighbor-card { background: #333; padding: 10px; border-radius: 4px; cursor: pointer; }
+        .neighbor-card img { width: 100%; height: 120px; object-fit: cover; border-radius: 4px; }
+        .close-btn { position: fixed; top: 20px; right: 20px; font-size: 30px; cursor: pointer; }
+        .ocr-full { background: #2a2a2a; padding: 20px; border-radius: 8px; margin-top: 20px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Screenshot Searcher</h1>
+
+        <div class="search-box">
+            <input type="text" id="searchInput" placeholder="Search screenshots...">
+            <select id="searchMode">
+                {# Available methods are passed from backend based on config #}
+                {% for method in search_methods %}
+                <option value="{{ method.id }}"{% if method.default %} selected{% endif %}%>{{ method.name }}</option>
+                {% endfor %}
+            </select>
+            <button onclick="search()">Search</button>
+        </div>
+
+        <div class="time-filter">
+            <label>From: <input type="datetime-local" id="startDate"></label>
+            <label>To: <input type="datetime-local" id="endDate"></label>
+        </div>
+
+        <div class="results" id="results"></div>
+    </div>
+
+    <div class="detail-modal" id="detailModal">
+        <span class="close-btn" onclick="closeModal()">&times;</span>
+        <div class="detail-content" id="detailContent"></div>
+    </div>
+
+    <script>
+        async function search() {
+            const q = document.getElementById('searchInput').value;
+            const mode = document.getElementById('searchMode').value;
+            const start = document.getElementById('startDate').value;
+            const end = document.getElementById('endDate').value;
+
+            const params = new URLSearchParams({ q, mode });
+            if (start) params.append('start_date', start);
+            if (end) params.append('end_date', end);
+
+            const res = await fetch('/api/search?' + params);
+            const data = await res.json();
+
+            const resultsEl = document.getElementById('results');
+            resultsEl.innerHTML = data.results.map(r => `
+                <div class="result-card" onclick="showDetail(${r.timestamp})">
+                    <img src="/static/screenshots/${r.screenshot_path.split('/').pop()}" loading="lazy">
+                    <div class="info">
+                        <div class="time">${r.timestamp_formatted}</div>
+                        <div class="window">${r.window_title || 'Unknown Window'}</div>
+                        <div class="ocr">${r.ocr_preview || ''}</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function showDetail(timestamp) {
+            const [detailRes, neighborsRes] = await Promise.all([
+                fetch(`/api/detail/${timestamp}`),
+                fetch(`/api/neighbors/${timestamp}`)
+            ]);
+
+            const detail = await detailRes.json();
+            const neighbors = await neighborsRes.json();
+
+            document.getElementById('detailContent').innerHTML = `
+                <img src="/static/screenshots/${detail.screenshot_path.split('/').pop()}">
+                <div class="info">
+                    <div class="time">${detail.timestamp_formatted}</div>
+                    <div class="window">${detail.window_title || 'Unknown Window'}</div>
+                </div>
+                ${detail.ocr_full ? `<div class="ocr-full">${detail.ocr_full}</div>` : ''}
+                <h3 style="margin-top: 30px;">Timeline Neighbors</h3>
+                <div class="neighbors">
+                    ${neighbors.neighbors.map(n => `
+                        <div class="neighbor-card" onclick="showDetail(${n.timestamp})">
+                            <img src="/static/screenshots/${n.screenshot_path.split('/').pop()}" loading="lazy">
+                            <div class="time">${n.timestamp_formatted}</div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+
+            document.getElementById('detailModal').style.display = 'block';
+        }
+
+        function closeModal() {
+            document.getElementById('detailModal').style.display = 'none';
+        }
+
+        // Close modal on escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
+
+        // Enter key triggers search
+        document.getElementById('searchInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') search();
+        });
+    </script>
+</body>
+</html>
+"""
+
+# DEPENDENCIES: None (pure HTML/CSS/JS)
+
+# =============================================================================
+# SECTION 16: SETUP.PY (setup.py)
+# =============================================================================
+
+"""
+# setup.py
+from setuptools import setup, find_packages
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+# Core dependencies (always required)
+core_deps = [
+    "mss>=9.0.0",
+    "Pillow>=10.0.0",
+    "pyyaml>=6.0.0",
+    "numpy>=1.24.0",
+    "requests>=2.28.0",  # For embedding API calls
+]
+
+# Optional feature dependencies
+ocr_deps = [
+    "pytesseract>=0.3.10",
+]
+
+# Embedding now uses API calls, no heavy dependencies needed
+embedding_deps = [
+    "requests>=2.28.0",  # Already in core, listed for clarity
+]
+
+webui_deps = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.6",
+    "aiofiles>=23.0.0",
+]
+
+search_deps = [
+    "nltk>=3.8.0",
+    "rank-bm25>=0.2.2",
+]
+
+# Platform-specific
+linux_deps = [
+    "python-xlib>=0.33",
+]
+
+windows_deps = [
+    "pygetwindow>=0.0.9",
+    "pywin32>=306",
+]
+
+# Convenience bundles
+all_deps = core_deps + ocr_deps + embedding_deps + webui_deps + search_deps + linux_deps
+
+setup(
+    name="screenshot-searcher",
+    version="0.1.0",
+    author="Your Name",
+    description="Search through your screenshot history with OCR and embeddings",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    packages=find_packages(),
+    python_requires=">=3.9",
+    install_requires=core_deps,
+    extras_require={
+        "ocr": ocr_deps,
+        "embedding": embedding_deps,
+        "embedding-search": embedding_deps + search_deps,
+        "semantic": embedding_deps + search_deps,  # alias
+        "webui": webui_deps,
+        "search": search_deps,
+        "linux": linux_deps,
+        "windows": windows_deps,
+        "all": all_deps,
+    },
+    entry_points={
+        "console_scripts": [
+            "screenshot-searcher=main:main",
+            "ss-webui=api:run_server",
+        ],
+    },
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: End Users/Desktop",
+        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+    ],
+)
+"""
+
+# =============================================================================
+# SECTION 17: REQUIREMENTS FILE (requirements.txt)
+# =============================================================================
+
+"""
+# Core dependencies (always required)
+mss>=9.0.0              # Screenshot capture
+Pillow>=10.0.0          # Image processing
+pyyaml>=6.0.0           # Configuration file support
+numpy>=1.24.0           # Numerical operations
+
+# Optional: OCR feature (pip install -e ".[ocr]")
+# pytesseract>=0.3.10   # OCR wrapper
+
+# Optional: Embedding/Semantic search
+# No additional Python dependencies - uses HTTP API calls
+# You need an OpenAI-compatible embedding endpoint:
+#   - Ollama (local): https://ollama.com
+#   - OpenAI (cloud): https://platform.openai.com
+#   - LocalAI (self-hosted): https://localai.io
+
+# Optional: Web UI (pip install -e ".[webui]")
+# fastapi>=0.100.0
+# uvicorn>=0.23.0
+# jinja2>=3.1.0
+# python-multipart>=0.0.6
+# aiofiles>=23.0.0
+
+# Optional: Search improvements (pip install -e ".[search]")
+# nltk>=3.8.0
+# rank-bm25>=0.2.2
+
+# Platform-specific (Linux) (pip install -e ".[linux]")
+# python-xlib>=0.33     # X11 window title capture
+
+# Platform-specific (Windows) (pip install -e ".[windows]")
+# pygetwindow>=0.0.9    # Windows window titles
+# pywin32>=306          # Windows API
+"""
+
+# =============================================================================
+# SECTION 17: EMBEDDING API CONFIGURATION
+# =============================================================================
+
+"""
+FLASHBACK EMBEDDING API SETUP
+
+Flashback uses OpenAI-compatible embedding APIs instead of local models.
+This allows flexibility in choosing providers and avoids large model downloads.
+
+SUPPORTED PROVIDERS:
+
+1. Ollama (Local - FREE, runs on your machine)
+   Installation: curl -fsSL https://ollama.com/install.sh | sh
+   Config:
+     workers.embedding.api.base_url: "http://localhost:11434/v1"
+     workers.embedding.api.model: "llava"  # or "bakllava" for vision
+     workers.embedding.api.api_key: ""  # No key needed for local
+
+2. OpenAI (Cloud - PAID)
+   Config:
+     workers.embedding.api.base_url: "https://api.openai.com/v1"
+     workers.embedding.api.model: "text-embedding-3-small"
+     workers.embedding.api.api_key: "${OPENAI_API_KEY}"
+
+3. LocalAI (Self-hosted - FREE)
+   Config:
+     workers.embedding.api.base_url: "http://localhost:8080/v1"
+     workers.embedding.api.model: "your-model-name"
+
+4. llama.cpp Server (Local - FREE)
+   Config:
+     workers.embedding.api.base_url: "http://localhost:8080/v1"
+     workers.embedding.api.model: "your-model"
+
+SETUP WORKFLOW:
+
+1. Choose a provider and set base_url + model in config.yaml
+
+2. Test the API connection and detect dimension:
+   flashback config test-embedding
+
+   This will output something like:
+     Testing embedding API...
+     Model: llava
+     Dimension: 4096
+     Success!
+
+3. Write the detected dimension to config:
+   flashback config test-embedding --write
+
+4. Start the workers:
+   flashback serve --daemon
+
+API KEY SECURITY:
+
+You can provide API keys in several ways:
+
+1. Environment variable (RECOMMENDED):
+   export OPENAI_API_KEY="sk-..."
+   In config.yaml: api_key: "${OPENAI_API_KEY}"
+
+2. Direct in config (less secure):
+   In config.yaml: api_key: "sk-..."
+
+3. ~/.netrc file (for some providers)
+
+CHANGING EMBEDDING MODELS:
+
+When you change embedding models, the dimensions may differ.
+Old embeddings will be incompatible.
+
+To switch models:
+1. Stop workers: flashback stop
+2. Purge old embeddings: flashback purge-embeddings --yes
+3. Update config with new model and dimension
+4. Start workers: flashback serve --daemon
+
+COMMON DIMENSIONS:
+- text-embedding-3-small: 1536
+- text-embedding-3-large: 3072
+- text-embedding-ada-002: 1536
+- nomic-embed-text: 768
+- llava: 4096
+- bakllava: 4096
+"""
+
+# =============================================================================
+# SECTION 18: SYSTEM DEPENDENCIES & INSTALL HELP
+# =============================================================================
+
+"""
+UBUNTU/DEBIAN INSTALLATION GUIDE
+
+1. Install Python dependencies:
+   pip install -e .                    # Core only
+   pip install -e ".[ocr]"             # With OCR
+   pip install -e ".[embedding]"       # With embeddings
+   pip install -e ".[webui]"           # With web interface
+   pip install -e ".[all]"             # Everything
+
+2. Install system dependencies:
+
+   REQUIRED (for OCR):
+   sudo apt-get install tesseract-ocr
+
+   OPTIONAL (OCR Languages - install as needed):
+   sudo apt-get install tesseract-ocr-eng    # English (usually included)
+   sudo apt-get install tesseract-ocr-chi-sim  # Simplified Chinese
+   sudo apt-get install tesseract-ocr-chi-tra  # Traditional Chinese
+   sudo apt-get install tesseract-ocr-fra    # French
+   sudo apt-get install tesseract-ocr-deu    # German
+   sudo apt-get install tesseract-ocr-spa    # Spanish
+   sudo apt-get install tesseract-ocr-jpn    # Japanese
+   sudo apt-get install tesseract-ocr-kor    # Korean
+   sudo apt-get install tesseract-ocr-rus    # Russian
+   sudo apt-get install tesseract-ocr-ara    # Arabic
+   sudo apt-get install tesseract-ocr-hin    # Hindi
+   sudo apt-get install tesseract-ocr-por    # Portuguese
+   sudo apt-get install tesseract-ocr-ita    # Italian
+   sudo apt-get install tesseract-ocr-nld    # Dutch
+   sudo apt-get install tesseract-ocr-tur    # Turkish
+   sudo apt-get install tesseract-ocr-vie    # Vietnamese
+
+   Or install all languages at once:
+   sudo apt-get install tesseract-ocr-all
+
+   SCREENSHOT (usually pre-installed):
+   sudo apt-get install gnome-screenshot  # or scrot, maim
+
+3. Download NLTK data (optional, for better text tokenization):
+   python -c "import nltk; nltk.download('punkt')"
+
+MACOS:
+   brew install tesseract
+   # Languages: brew install tesseract-lang
+
+WINDOWS:
+   Download from: https://github.com/UB-Mannheim/tesseract/wiki
+   Add to PATH during installation
+"""
+
+"""
+# Ubuntu/Debian:
+#   sudo apt-get install tesseract-ocr tesseract-ocr-eng
+#
+# macOS:
+#   brew install tesseract
+#
+# Windows:
+#   Download installer from: https://github.com/UB-Mannheim/tesseract/wiki
+#   Add to PATH
+"""
+
+# =============================================================================
+# SECTION 19: INSTALLATION & USAGE INSTRUCTIONS
+# =============================================================================
+
+"""
+# 1. Create virtual environment
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+venv\Scripts\activate     # Windows
+
+# 2. Clone/navigate to project
+cd screenshot-searcher
+
+# 3. Install with desired features:
+pip install -e .                    # Core only (screenshot + cleanup)
+pip install -e ".[ocr]"             # Add OCR text extraction
+pip install -e ".[embedding]"       # Add image embeddings
+pip install -e ".[webui]"           # Add web interface
+pip install -e ".[search]"          # Add BM25 text search improvements
+pip install -e ".[all]"             # Install everything
+
+# 4. Install system dependencies (Ubuntu/Debian)
+sudo apt-get install tesseract-ocr
+
+# Optional: install language packs for OCR
+sudo apt-get install tesseract-ocr-chi-sim  # Chinese Simplified
+sudo apt-get install tesseract-ocr-chi-tra  # Chinese Traditional
+sudo apt-get install tesseract-ocr-jpn      # Japanese
+# (see SECTION 17 for full list)
+
+# 5. Create config file (optional - uses defaults if missing)
+mkdir -p ~/.config/screenshot-searcher
+cp config.example.yaml ~/.config/screenshot-searcher/config.yaml
+# Edit to enable/disable workers and set preferences
+
+# 6. Configure embedding API (optional, for semantic search)
+# Example with Ollama (local):
+#   ollama pull llava
+#   flashback config set workers.embedding.api.base_url "http://localhost:11434/v1"
+#   flashback config set workers.embedding.api.model "llava"
+#   flashback config test-embedding --write  # Detects dimension and writes to config
+
+# Example with OpenAI:
+#   export OPENAI_API_KEY="sk-..."
+#   flashback config set workers.embedding.api.base_url "https://api.openai.com/v1"
+#   flashback config set workers.embedding.api.model "text-embedding-3-small"
+#   flashback config set workers.embedding.api.api_key "${OPENAI_API_KEY}"
+#   flashback config test-embedding --write
+
+# 7. Run the workers (captures screenshots and processes)
+flashback serve --daemon
+
+# 8. Start the web interface (in a new terminal)
+flashback webui
+
+# 9. Open browser to http://localhost:8080
+"""
+
+# =============================================================================
+# SECTION 20: STORAGE SIZE ESTIMATES
+# =============================================================================
+
+"""
+ASSUMPTIONS (1920x1080 display):
+- PNG screenshot: ~200 KB (with compression)
+- OCR text file: ~5 KB average
+- Embedding: ~2-12 KB (varies by API: 768-dim ~3 KB, 4096-dim ~16 KB)
+
+PER MINUTE: ~210-220 KB
+PER HOUR: ~12-13 MB
+PER DAY: ~300-320 MB
+PER WEEK: ~2.1-2.2 GB
+PER MONTH: ~9-10 GB
+
+With 7-day retention: ~2-3 GB total storage
+(Depends on embedding API dimension)
+
+To reduce storage:
+- Lower screenshot quality (config.py)
+- Reduce frequency (e.g., every 5 minutes)
+- Shorter retention period
+- Store only thumbnails for search results
+"""
+
+# =============================================================================
+# SECTION 21: FEATURE/DEPENDENCY MATRIX
+# =============================================================================
+
+"""
+QUICK REFERENCE: Features and their dependencies
+
+| Feature        | pip install        | System Deps              | Config Section     |
+|----------------|--------------------|--------------------------|--------------------|
+| Core           | pip install -e .   | none                     | screenshot, cleanup|
+| OCR            | .[ocr]             | tesseract-ocr            | workers.ocr        |
+| OCR Languages  | -                  | tesseract-ocr-<lang>     | workers.ocr.languages|
+| Embeddings     | .[embedding]       | Embedding API endpoint   | workers.embedding.api |
+| BM25 Search    | .[search]          | none                     | search.bm25        |
+| Web UI         | .[webui]           | none                     | webui              |
+| Window Title   | .[linux] or .[win] | none                     | workers.window_title|
+
+CONFIG OVERRIDES (environment variables):
+  SS_CONFIG=/path/to/config.yaml    # Specify config file location
+  SS_DATA_DIR=/path/to/data         # Override data directory
+
+TROUBLESHOOTING:
+
+1. "tesseract not found" error:
+   sudo apt-get install tesseract-ocr
+
+2. "Missing OCR language" warning:
+   Check available: tesseract --list-langs
+   Install more:   sudo apt-get install tesseract-ocr-<lang>
+
+3. "pytesseract not found" error:
+   pip install pytesseract
+   OR enable it: pip install -e ".[ocr]"
+
+4. "Embedding API not configured" error:
+   Set workers.embedding.api.base_url and model in config.yaml
+   Example for Ollama: base_url: "http://localhost:11434/v1"
+   Example for OpenAI: base_url: "https://api.openai.com/v1"
+
+5. "Embedding dimension not configured" error:
+   Run: flashback config test-embedding --write
+   This tests the API and automatically sets the dimension
+
+6. Embedding dimension mismatch warning:
+   The stored embeddings don't match the configured dimension.
+   This happens when changing embedding models.
+   Fix: flashback purge-embeddings --yes
+   Then restart the workers to regenerate embeddings.
+
+7. High memory usage:
+   Reduce batch sizes in config.yaml:
+     workers.ocr.batch_size: 2
+     workers.embedding.batch_size: 1
+"""
+
+# =============================================================================
+# SECTION 22: FLASHBACK CLI DESIGN PLAN
+# =============================================================================
+
+"""
+PROJECT RENAMING: Package name is "flashback-screenshots", CLI command is "flashback"
+
+PACKAGE STRUCTURE:
+flashback_screenshots/
+├── __init__.py
+├── cli.py                 # Main CLI entry point
+├── backend.py             # Backend daemon management
+├── api_server.py          # Web UI server
+├── health.py              # Health check utilities
+├── config.py              # Config management
+├── database.py            # Database operations
+├── workers/               # Worker implementations
+├── templates/             # HTML templates
+└── static/                # Web assets
+
+ENTRY POINTS (setup.py):
+console_scripts = [
+    "flashback=flashback_screenshots.cli:main",
+    "flashback-api=flashback_screenshots.api_server:main",
+]
+"""
+
+# -----------------------------------------------------------------------------
+# CLI COMMAND STRUCTURE (flashback)
+# -----------------------------------------------------------------------------
+
+"""
+MAIN COMMAND: flashback
+
+SUBCOMMANDS:
+  flashback serve          Start the backend daemon (screenshot + workers)
+  flashback webui          Start web UI daemon
+  flashback status         Check backend health/status
+  flashback search         Search screenshots from CLI
+  flashback view           View specific screenshot by timestamp
+  flashback config         Show/edit configuration
+  flashback stop           Stop running daemon
+  flashback logs           Show daemon logs
+
+GLOBAL FLAGS:
+  --config, -c PATH        Use specific config file
+  --data-dir, -d PATH      Override data directory
+  --verbose, -v            Verbose output
+  --version                Show version
+  --help                   Show help
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback serve (Backend Daemon)
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback serve [OPTIONS]
+
+DESCRIPTION:
+  Starts the background daemon that captures screenshots and runs all
+  enabled workers (OCR, embedding, cleanup, window title tracking).
+
+OPTIONS:
+  --daemon, -D             Run as background daemon (detached)
+  --foreground, -F         Run in foreground (default)
+  --pid-file PATH          Write PID to file
+  --log-file PATH          Write logs to file (default: ~/.local/share/flashback/flashback.log)
+
+EXAMPLES:
+  flashback serve                    # Run in foreground
+  flashback serve --daemon           # Run as background daemon
+  flashback serve -D --pid-file /tmp/flashback.pid
+
+BEHAVIOR:
+  - Reads config.yaml for enabled workers
+  - Checks dependencies (tesseract, etc.) on startup
+  - Creates PID file for tracking
+  - Handles SIGTERM/SIGINT for graceful shutdown
+  - If already running, shows error with PID
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback webui (Web UI Daemon)
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback webui [OPTIONS]
+
+DESCRIPTION:
+  Starts the web UI server (FastAPI) for browser-based searching.
+
+OPTIONS:
+  --host HOST              Bind address (default: 127.0.0.1)
+  --port PORT              Port number (default: 8080)
+  --daemon, -D             Run as background daemon
+  --foreground, -F         Run in foreground (default)
+  --no-browser             Don't auto-open browser
+  --pid-file PATH          Write PID to file
+
+EXAMPLES:
+  flashback webui                    # Run on default port, auto-open browser
+  flashback webui --port 3000        # Run on custom port
+  flashback webui -D                 # Daemon mode
+
+BEHAVIOR:
+  - Checks if backend is running (warns if not)
+  - Auto-opens browser unless --no-browser
+  - Serves static files and API endpoints
+  - Graceful shutdown on signal
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback status (Health Check)
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback status [OPTIONS]
+
+DESCRIPTION:
+  Check health and status of backend and webui daemons.
+
+OPTIONS:
+  --json                   Output as JSON
+  --watch, -w              Watch mode (refresh every N seconds)
+
+EXAMPLES:
+  flashback status
+  flashback status --json
+  flashback status -w 5
+
+OUTPUT (text mode):
+  Backend:  RUNNING (PID: 12345)
+    - Screenshot:  active (last capture: 30s ago)
+    - OCR:         active (queue: 3 pending)
+    - Embedding:   active (queue: 0 pending)
+    - Cleanup:     active (last run: 45m ago)
+    - Window:      active
+
+  WebUI:    STOPPED
+
+  Database: /home/user/flashback-data/database.db
+  Screenshots: 1,247 (retention: 7 days)
+  Storage: 234 MB / 2.1 GB
+
+OUTPUT (json mode):
+  {
+    "backend": {
+      "running": true,
+      "pid": 12345,
+      "workers": {
+        "screenshot": {"active": true, "last_capture": 1742345000},
+        "ocr": {"active": true, "queue_size": 3},
+        "embedding": {"active": true, "queue_size": 0},
+        "cleanup": {"active": true, "last_run": 1742342000},
+        "window_title": {"active": true}
+      }
+    },
+    "webui": {"running": false},
+    "database": {
+      "path": "/home/user/flashback-data/database.db",
+      "screenshot_count": 1247,
+      "storage_mb": 234
+    }
+  }
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback search (CLI Search)
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback search [OPTIONS] [QUERY]
+
+DESCRIPTION:
+  Search through screenshot history from command line.
+  Supports text queries, image queries, or both (multi-modal).
+
+ARGUMENTS:
+  QUERY                    Search query text (optional if --image provided)
+
+OPTIONS:
+  --image, -i PATH         Search using an image file (finds visually similar screenshots)
+  --search-mode MODE       Search mode from config (default: text_hybrid)
+                           Options: bm25_only, text_embedding_only, text_hybrid,
+                                    image_embedding_only, text_and_image, comprehensive
+  --limit, -n N            Max results (default: 20)
+  --from, -f DATE          Start date/time (ISO format or relative)
+  --to, -t DATE            End date/time (ISO format or relative)
+  --format, -F FORMAT      Output: table (default), json, csv, simple
+  --preview, -p            Show OCR text excerpt
+  --open, -o               Open first result in image viewer
+
+SEARCH MODES:
+  bm25_only                BM25 text search (fast, keyword-based)
+  text_embedding_only      Semantic text search (finds conceptually related text)
+  text_hybrid              BM25 + text embedding (recommended for text queries)
+  image_embedding_only     Visual similarity search (requires --image)
+  text_and_image           Multi-modal search with both text and image query
+  comprehensive            All methods combined (requires --image for full effect)
+
+TIME FORMATS for --from/--to:
+  - Absolute: 2024-03-20, 2024-03-20T14:30:00
+  - Relative: 1h (1 hour ago), 1d (1 day ago), 30m (30 minutes ago)
+
+EXAMPLES:
+  # Text-based searches
+  flashback search "meeting notes"
+  flashback search --search-mode text_embedding_only "dashboard with charts"
+  flashback search "error message" --from 1d --to now
+  flashback search "login page" -n 5 --open
+  flashback search "TODO" -F json --from 2024-03-01 -t 2024-03-15
+  flashback search "invoice" --preview -n 10
+
+  # Image-based searches (find visually similar screenshots)
+  flashback search --image screenshot.png
+  flashback search --image photo.jpg --search-mode image_embedding_only
+  flashback search --image logo.png --limit 10
+
+  # Multi-modal searches (combining text and image)
+  flashback search "error message" --image screenshot.png
+  flashback search "meeting" --image whiteboard.jpg -n 20
+
+OUTPUT (table format):
+  #  Time                 Score  Window Title        Preview
+  1  2024-03-20 14:23:12  0.92   Firefox - Gmail     "meeting notes from march..."
+  2  2024-03-20 13:45:01  0.87   VS Code             "notes: project meeting..."
+  3  2024-03-19 09:12:33  0.81   Obsidian            "Meeting Notes - Q1 review"
+
+OUTPUT (simple format - for piping):
+  /home/user/flashback-data/screenshots/20240320_142312.png
+  /home/user/flashback-data/screenshots/20240320_134501.png
+  /home/user/flashback-data/screenshots/20240319_091233.png
+
+INTERACTION:
+  - By default: shows list with metadata, text excerpts truncated
+  - With --preview: shows full OCR text (first 500 chars)
+  - With --open: launches system image viewer with first result
+  - Without --open: user can select result by number to view
+
+VIEWING WORKFLOW:
+  After search results appear:
+    Press 1-9 to open screenshot N in image viewer
+    Press 'v' to view OCR text of selected
+    Press 'q' to quit
+    Press Enter to refine search
+
+Rationale for system image viewer:
+  - Native zoom, pan, fullscreen
+  - No web dependencies
+  - Works over SSH with X forwarding
+  - Users can configure their preferred viewer (feh, eog, xdg-open, etc.)
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback view (Direct Screenshot Viewer)
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback view [OPTIONS] [TIMESTAMP_OR_PATH]
+
+DESCRIPTION:
+  View a specific screenshot by timestamp or file path.
+  Launches system image viewer.
+
+ARGUMENTS:
+  TIMESTAMP_OR_PATH        Screenshot timestamp or file path
+                           (timestamp: YYYYMMDD_HHMMSS or YYYY-MM-DD HH:MM:SS)
+
+OPTIONS:
+  --text, -t               Show OCR text in terminal (don't open image)
+  --neighbors, -n N        Show N timeline neighbors (default: 5)
+  --copy, -c               Copy image path to clipboard
+  --export PATH            Copy image to specified path
+
+EXAMPLES:
+  flashback view 20240320_142312
+  flashback view "2024-03-20 14:23:12"
+  flashback view /path/to/screenshot.png
+  flashback view 20240320_142312 -t           # Show OCR text only
+  flashback view 20240320_142312 -n 10        # View with neighbors
+  flashback view 20240320_142312 --export ~/Downloads/screenshot.png
+
+NEIGHBORS VIEW:
+  When -n is specified, opens all screenshots in a grid view (if viewer
+  supports it) or prints paths with context:
+
+    [-5m] 14:18:23  (previous)
+    [-2m] 14:21:05  (previous)
+    [ NOW] 14:23:12  <-- SELECTED
+    [+1m] 14:24:33  (next)
+    [+3m] 14:26:15  (next)
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback config (Configuration)
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback config [COMMAND] [OPTIONS]
+
+COMMANDS:
+  show                     Display current configuration
+  edit                     Open config in $EDITOR
+  init                     Create default config file
+  get KEY                  Get specific config value
+  set KEY VALUE            Set specific config value
+  validate                 Validate config file
+  test-embedding           Test embedding API and detect dimension
+  purge-embeddings         Delete all stored embeddings
+
+EXAMPLES:
+  flashback config show
+  flashback config edit
+  flashback config init --path ~/.config/flashback/config.yaml
+  flashback config get workers.ocr.enabled
+  flashback config set workers.screenshot.interval_seconds 300
+  flashback config test-embedding --type text --write      # Test text embedding API
+  flashback config test-embedding --type image --write     # Test image embedding API
+  flashback config purge-embeddings --yes  # Delete all embeddings
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback stop
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback stop [OPTIONS]
+
+DESCRIPTION:
+  Stop running daemon(s).
+
+OPTIONS:
+  --backend                Stop only backend daemon
+  --webui                  Stop only webui daemon
+  --all                    Stop all (default)
+  --force, -f              Force kill (SIGKILL)
+
+EXAMPLES:
+  flashback stop             # Stop all daemons
+  flashback stop --backend   # Stop only backend
+  flashback stop -f          # Force kill
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback logs
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback logs [OPTIONS]
+
+OPTIONS:
+  --follow, -f             Follow log output (tail -f style)
+  --lines, -n N            Show last N lines (default: 50)
+  --backend                Show backend logs
+  --webui                  Show webui logs
+  --clear                  Clear log files
+
+EXAMPLES:
+  flashback logs
+  flashback logs -f
+  flashback logs -n 100 --backend
+"""
+
+# -----------------------------------------------------------------------------
+# COMMAND: flashback purge-embeddings
+# -----------------------------------------------------------------------------
+
+"""
+USAGE:
+  flashback purge-embeddings [OPTIONS]
+
+DESCRIPTION:
+  Delete all stored embeddings and reset embedding database records.
+  This is useful when:
+  - Changing embedding models (dimension mismatch)
+  - Corrupted embedding files
+  - Need to reprocess all screenshots with new API
+
+OPTIONS:
+  --yes, -y                Skip confirmation prompt
+  --restart-workers        Restart embedding worker after purge
+
+EXAMPLES:
+  flashback purge-embeddings --yes
+  flashback purge-embeddings --yes --restart-workers
+
+BEHAVIOR:
+  1. Stops embedding worker if running
+  2. Deletes all .npy files in embeddings directory
+  3. Clears embedding_path from database records
+  4. Optionally restarts embedding worker
+
+WARNING: This will require re-processing all screenshots for embeddings,
+which may take time and incur API costs.
+"""
+
+# =============================================================================
+# SECTION 23: API DESIGN PLAN (RESTful API)
+# =============================================================================
+
+"""
+BASE URL: http://localhost:8080/api/v1
+
+All endpoints return JSON unless otherwise specified.
+Error format:
+  {
+    "error": "ErrorType",
+    "message": "Human readable description",
+    "code": 400
+  }
+
+AUTHENTICATION:
+  Currently no authentication (local only).
+  Future: API key in header X-Flashback-Key
+"""
+
+# -----------------------------------------------------------------------------
+# HEALTH & STATUS ENDPOINTS
+# -----------------------------------------------------------------------------
+
+"""
+GET /health
+  Returns: {"status": "healthy" | "degraded" | "unhealthy", "components": {...}}
+
+GET /status
+  Full system status including all workers, queues, storage stats.
+
+  Response:
+  {
+    "backend": {
+      "running": true,
+      "pid": 12345,
+      "uptime_seconds": 86400,
+      "workers": {
+        "screenshot": {
+          "enabled": true,
+          "active": true,
+          "last_capture": "2024-03-20T14:23:12Z",
+          "capture_count": 1440
+        },
+        "ocr": {
+          "enabled": true,
+          "active": true,
+          "queue_size": 3,
+          "processed_count": 1437
+        },
+        "embedding": {
+          "enabled": true,
+          "active": true,
+          "queue_size": 0,
+          "processed_count": 1437
+        },
+        "cleanup": {
+          "enabled": true,
+          "last_run": "2024-03-20T14:00:00Z",
+          "deleted_count": 1440
+        },
+        "window_title": {
+          "enabled": true,
+          "active": true
+        }
+      }
+    },
+    "storage": {
+      "screenshots_dir": "/home/user/flashback-data/screenshots",
+      "database_path": "/home/user/flashback-data/database.db",
+      "screenshot_count": 1247,
+      "oldest_screenshot": "2024-03-13T14:23:12Z",
+      "newest_screenshot": "2024-03-20T14:23:12Z",
+      "total_size_mb": 234.5,
+      "retention_days": 7
+    },
+    "config": {
+      "ocr_enabled": true,
+      "embedding_enabled": true,
+      "search_methods": ["bm25", "embedding"]
+    }
+  }
+"""
+
+# -----------------------------------------------------------------------------
+# SEARCH ENDPOINTS
+# -----------------------------------------------------------------------------
+
+"""
+GET /search
+  Full-text, semantic, and visual search across screenshots.
+
+  Query Parameters:
+    q (optional)          Search query text (required if image not provided)
+    search_mode           Search mode from config (default: "text_hybrid")
+                          Options: bm25_only, text_embedding_only, text_hybrid,
+                                   image_embedding_only, text_and_image, comprehensive
+    limit                 Max results (default: 20, max: 100)
+    offset                Pagination offset
+    from                  ISO8601 start timestamp
+    to                    ISO8601 end timestamp
+    window_title          Filter by window title (substring match)
+
+  Response:
+  {
+    "query": "search terms",
+    "search_mode": "text_hybrid",
+    "total": 45,
+    "offset": 0,
+    "limit": 20,
+    "results": [
+      {
+        "id": 1234,
+        "timestamp": 1710944592,
+        "timestamp_formatted": "2024-03-20T14:23:12Z",
+        "screenshot_path": "/data/screenshots/20240320_142312.png",
+        "screenshot_url": "/static/screenshots/20240320_142312.png",
+        "window_title": "VS Code - main.py",
+        "ocr_text_preview": "def main():\n    print('hello world')...",
+        "ocr_text_full": "...",
+        "score": 0.9234,
+        "score_breakdown": {
+          "bm25": 0.85,
+          "text_embedding": 0.91
+        },
+        "has_embedding": true
+      }
+    ]
+  }
+
+GET /search/similar
+  Find screenshots similar to a given image (URL) or text.
+
+  Query Parameters:
+    image_url             URL to image file
+    text                  Text description
+    search_mode           Search mode to use
+    limit                 Max results
+    from, to              Time range
+
+POST /search/image
+  Upload an image file to find visually similar screenshots.
+
+  Content-Type: multipart/form-data
+  Parameters:
+    image                 Image file (required)
+    q                     Optional text query for multi-modal search
+    search_mode           Search mode: "image_embedding_only" (default),
+                          "text_and_image", or "comprehensive"
+    limit                 Max results
+    from, to              Time range
+
+  Response: Same structure as GET /search
+
+POST /search/multi-modal
+  Search with both text and image (multi-modal query).
+
+  Content-Type: multipart/form-data
+  Parameters:
+    q                     Text query (required)
+    image                 Image file (required)
+    search_mode           Default: "text_and_image"
+    limit                 Max results
+
+  Notes:
+  - Uses reciprocal rank fusion to combine text and image search results
+  - Returns results ranked by combined relevance
+"""
+
+# -----------------------------------------------------------------------------
+# SCREENSHOT ENDPOINTS
+# -----------------------------------------------------------------------------
+
+"""
+GET /screenshots
+  List screenshots with pagination and filtering.
+
+  Query Parameters:
+    from                  Start timestamp
+    to                    End timestamp
+    window_title          Filter by window title
+    has_ocr               Filter: true/false
+    has_embedding         Filter: true/false
+    limit, offset         Pagination
+
+  Response:
+  {
+    "total": 1247,
+    "results": [
+      {
+        "id": 1234,
+        "timestamp": 1710944592,
+        "screenshot_url": "/static/screenshots/20240320_142312.png",
+        "window_title": "Firefox",
+        "thumbnail_url": "/static/thumbnails/20240320_142312.jpg",
+        "has_ocr": true,
+        "has_embedding": true
+      }
+    ]
+  }
+
+GET /screenshots/{timestamp}
+  Get full details of a specific screenshot.
+
+  Response:
+  {
+    "id": 1234,
+    "timestamp": 1710944592,
+    "timestamp_formatted": "2024-03-20T14:23:12Z",
+    "screenshot_path": "/data/screenshots/20240320_142312.png",
+    "screenshot_url": "/static/screenshots/20240320_142312.png",
+    "ocr_path": "/data/ocr/20240320_142312.txt",
+    "embedding_path": "/data/embeddings/20240320_142312.npy",
+    "window_title": "VS Code - project",
+    "ocr_text": "full OCR content here...",
+    "created_at": 1710944592
+  }
+
+GET /screenshots/{timestamp}/neighbors
+  Get screenshots near a timestamp (timeline view).
+
+  Query Parameters:
+    before                Number of screenshots before (default: 5)
+    after                 Number of screenshots after (default: 5)
+    window_minutes        Alternative: time window in minutes (overrides before/after)
+
+  Response:
+  {
+    "center_timestamp": 1710944592,
+    "screenshots": [
+      {
+        "relative": "-5m",
+        "timestamp": 1710944292,
+        "screenshot_url": "...",
+        "window_title": "...",
+        "is_center": false
+      },
+      {
+        "relative": "0m",
+        "timestamp": 1710944592,
+        "screenshot_url": "...",
+        "window_title": "...",
+        "is_center": true
+      }
+    ]
+  }
+
+DELETE /screenshots/{timestamp}
+  Delete a specific screenshot and its data.
+  (Requires confirmation or force flag)
+
+GET /screenshots/{timestamp}/export
+  Export screenshot with metadata as a ZIP or JSON+image.
+
+  Query Parameters:
+    format                "zip" or "json" (default: zip)
+"""
+
+# -----------------------------------------------------------------------------
+# OCR ENDPOINTS
+# -----------------------------------------------------------------------------
+
+"""
+GET /screenshots/{timestamp}/ocr
+  Get OCR text for a screenshot.
+
+  Query Parameters:
+    format                "text" (plain), "json" (with metadata), "html" (highlighted)
+
+  Response (json):
+  {
+    "timestamp": 1710944592,
+    "text": "extracted text content...",
+    "language": "eng",
+    "confidence": 0.89,
+    "word_count": 150
+  }
+
+GET /ocr/batch
+  Get OCR for multiple screenshots at once.
+
+  POST Body: {"timestamps": [1710944592, 1710944655, ...]}
+"""
+
+# -----------------------------------------------------------------------------
+# CONFIG ENDPOINTS
+# -----------------------------------------------------------------------------
+
+"""
+GET /config
+  Get current configuration (sensitive values masked).
+
+PUT /config
+  Update configuration values.
+  Body: partial config object
+
+POST /config/reload
+  Reload configuration from file.
+"""
+
+# -----------------------------------------------------------------------------
+# WEBSOCKET ENDPOINTS (Real-time)
+# -----------------------------------------------------------------------------
+
+"""
+WS /ws
+  WebSocket for real-time updates.
+
+  Events sent to client:
+    {"type": "screenshot", "timestamp": 1710944592, "url": "..."}
+    {"type": "ocr_complete", "timestamp": 1710944592}
+    {"type": "search_result", "query_id": "...", "results": [...]}
+
+  Use case: Live search results in web UI as you type
+"""
+
+# =============================================================================
+# SECTION 24: VIEWING STRATEGY - TEXT vs IMAGE VIEWER
+# =============================================================================
+
+"""
+DECISION: Hybrid approach - Text excerpts in CLI, System viewer for images
+
+CLI SEARCH WORKFLOW:
+1. User runs: flashback search "meeting notes"
+2. CLI queries database for matching screenshots
+3. CLI displays table with:
+   - Row number (for selection)
+   - Timestamp
+   - Window title
+   - BM25/embedding score
+   - OCR text excerpt (first 100-150 chars, truncated with ...)
+4. User presses number (1-9) or 'v' to view
+
+VIEWING OPTIONS:
+
+Option A: Text excerpt (default in search results)
+  Pros: Fast, terminal-native, searchable, copy-paste friendly
+  Cons: No visual context, formatting lost
+  Use: Initial triage, quick identification
+
+Option B: System image viewer (on selection)
+  Pros: Native zoom, pan, fullscreen, fast GPU rendering
+  Cons: Requires X/Wayland, different app window
+  Use: Detailed inspection, reading small text, visual context
+
+Option C: Web UI
+  Pros: Integrated view, neighbors timeline, zoom controls
+  Cons: Requires browser, more resource usage
+  Use: Deep research, browsing history
+
+RECOMMENDED CLI WORKFLOW:
+  $ flashback search "deploy failed"
+  # Shows 10 results with text excerpts
+  # Press 3 to open #3 in image viewer
+  # Image viewer opens (feh, eog, xdg-open)
+  # Press 'n' in viewer for next result (if supported)
+  # Close viewer, back to CLI
+
+CONFIGURABLE IMAGE VIEWER:
+  In config.yaml:
+    viewer:
+      command: "feh"           # or "eog", "xdg-open", "gimp"
+      args: ["--scale-down", "{path}"]
+      neighbor_args: ["--start-at", "{path}", "{neighbor_paths}"]
+
+  Default behavior:
+    Linux:   xdg-open {path}
+    macOS:   open {path}
+    Windows: start {path}
+
+WHY SYSTEM VIEWER OVER BUILT-IN:
+1. No reinventing the wheel - image viewers are mature
+2. User preference - respects their chosen tool
+3. Feature parity - get zoom, rotate, metadata for free
+4. SSH friendly - works with X forwarding
+5. Low resource - no embedded web view or image lib dependencies
+
+EDGE CASES:
+- SSH without X11: fall back to ASCII art or text only
+- Terminal doesn't support images: use text excerpts only
+- Image viewer not found: error with install suggestions
+"""
+
+# =============================================================================
+# SECTION 25: UPDATED PROJECT STRUCTURE (flashback)
+# =============================================================================
+
+"""
+flashback-screenshots/                    # Package directory
+├── pyproject.toml                        # Modern Python packaging
+├── setup.py                              # Backwards compat
+├── README.md
+├── LICENSE
+│
+├── flashback/                            # Main package (import as 'flashback')
+│   ├── __init__.py
+│   ├── __main__.py                       # Allows: python -m flashback
+│   ├── version.py                        # Version string
+│   │
+│   ├── cli/                              # CLI implementation
+│   │   ├── __init__.py
+│   │   ├── main.py                       # flashback main command
+│   │   ├── serve.py                      # flashback serve
+│   │   ├── webui.py                      # flashback webui
+│   │   ├── status.py                     # flashback status
+│   │   ├── search.py                     # flashback search
+│   │   ├── view.py                       # flashback view
+│   │   ├── config_cmd.py                 # flashback config
+│   │   └── utils.py                      # CLI helpers
+│   │
+│   ├── core/                             # Core functionality
+│   │   ├── __init__.py
+│   │   ├── config.py                     # YAML config management
+│   │   ├── database.py                   # SQLite operations
+│   │   ├── models.py                     # Data models (dataclasses)
+│   │   ├── paths.py                      # Path utilities
+│   │   └── daemon.py                     # Daemon/pidfile management
+│   │
+│   ├── workers/                          # Background workers
+│   │   ├── __init__.py
+│   │   ├── base.py                       # Base worker class
+│   │   ├── screenshot.py
+│   │   ├── ocr.py
+│   │   ├── embedding.py
+│   │   ├── cleanup.py
+│   │   └── window_title.py
+│   │
+│   ├── search/                           # Search implementations
+│   │   ├── __init__.py
+│   │   ├── bm25.py                       # BM25 text search
+│   │   ├── embedding.py                  # Semantic search
+│   │   └── fusion.py                     # Hybrid search (RRF)
+│   │
+│   ├── api/                              # Web API
+│   │   ├── __init__.py
+│   │   ├── server.py                     # FastAPI app setup
+│   │   ├── routes/                       # API endpoints
+│   │   │   ├── __init__.py
+│   │   │   ├── health.py
+│   │   │   ├── search.py
+│   │   │   ├── screenshots.py
+│   │   │   └── config.py
+│   │   ├── websockets.py                 # Real-time updates
+│   │   └── static/                       # Static assets
+│   │       ├── css/
+│   │       ├── js/
+│   │       └── img/
+│   │
+│   └── web/                              # Web UI templates
+│       ├── templates/
+│       │   ├── index.html
+│       │   ├── search.html
+│       │   └── detail.html
+│       └── components/                   # Reusable template parts
+│
+├── config.example.yaml                   # Example configuration
+├── requirements/
+│   ├── base.txt
+│   ├── ocr.txt
+│   ├── embedding.txt
+│   ├── webui.txt
+│   └── dev.txt
+│
+└── tests/                                # Test suite
+    ├── unit/
+    ├── integration/
+    └── conftest.py
+
+INSTALLATION NAMES:
+  pip install flashback-screenshots
+
+CLI COMMANDS:
+  flashback                               # Show help
+  flashback serve                         # Start backend
+  flashback webui                         # Start web UI
+  flashback status                        # Check health
+  flashback search QUERY                  # Search from CLI
+  flashback view TIMESTAMP                # View screenshot
+  flashback config                        # Manage config
+  flashback stop                          # Stop daemons
+  flashback logs                          # View logs
+
+PYTHON API:
+  from flashback import Database, Config
+  from flashback.search import BM25Search
+
+  config = Config()
+  db = Database(config.db_path)
+  results = db.search("query")
+"""
+
+# =============================================================================
+# SECTION 26: UPDATED SETUP.PY (flashback-screenshots)
+# =============================================================================
+
+"""
+# pyproject.toml (modern Python packaging)
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashback-screenshots"
+version = "0.1.0"
+description = "Search through your screenshot history with OCR and semantic search"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "you@example.com"}
+]
+keywords = ["screenshot", "ocr", "search", "history", "flashback"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "mss>=9.0.0",
+    "Pillow>=10.0.0",
+    "pyyaml>=6.0.0",
+    "numpy>=1.24.0",
+    "requests>=2.28.0",          # HTTP client for embedding APIs
+    "click>=8.0.0",              # CLI framework
+    "rich>=13.0.0",              # Terminal formatting
+    "platformdirs>=3.0.0",       # XDG dirs for logs/pidfiles
+    "psutil>=5.9.0",             # Process management for daemon
+]
+
+[project.optional-dependencies]
+ocr = ["pytesseract>=0.3.10"]
+embedding = []  # No extra deps - uses HTTP API calls
+search = ["nltk>=3.8.0", "rank-bm25>=0.2.2"]
+webui = ["fastapi>=0.100.0", "uvicorn>=0.23.0", "jinja2>=3.1.0", "python-multipart>=0.0.6"]
+linux = ["python-xlib>=0.33"]
+windows = ["pygetwindow>=0.0.9", "pywin32>=306"]
+all = [
+    "flashback-screenshots[ocr,search,webui]"
+]
+
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+flashback = "flashback.cli.main:main"
+flashback-api = "flashback.api.server:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/flashback-screenshots"
+Repository = "https://github.com/yourusername/flashback-screenshots"
+Issues = "https://github.com/yourusername/flashback-screenshots/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flashback*"]
+"""
+
+# =============================================================================
+# SECTION 27: CLI USAGE EXAMPLES (Complete Workflow)
+# =============================================================================
+
+"""
+COMPLETE WORKFLOW EXAMPLE:
+
+# 1. Install
+pip install flashback-screenshots[all]
+
+# 2. Start backend daemon
+flashback serve --daemon
+
+# 3. Start web UI (optional)
+flashback webui --daemon
+
+# 4. Check everything is running
+flashback status
+
+# 5. Search from CLI (text only)
+flashback search "important email"
+
+# 6. Search with time range
+flashback search "meeting" --from 1d --to now
+
+# 7. Search and open best match
+flashback search "error message" --open
+
+# 8. Search with JSON output for scripting
+flashback search "invoice" --format json | jq '.results[0].screenshot_path'
+
+# 9. View specific screenshot
+flashback view 20240320_142312
+
+# 10. View with neighbors (timeline context)
+flashback view 20240320_142312 --neighbors 10
+
+# 11. Get OCR text only
+flashback view 20240320_142312 --text
+
+# 12. Export screenshot
+flashback view 20240320_142312 --export ~/Documents/evidence.png
+
+# 13. View logs
+flashback logs --follow
+
+# 14. Stop everything
+flashback stop --all
+
+WEB UI WORKFLOW:
+  http://localhost:8080
+  - Search with visual results
+  - Click result for detail view
+  - Scroll timeline neighbors
+  - Click neighbor to jump
+
+CONFIGURATION:
+  flashback config edit
+  # Or directly:
+  flashback config set workers.ocr.enabled true
+  flashback config set workers.ocr.languages ["eng","chi_sim"]
+  flashback config reload
+"""
+
+# =============================================================================
+# END OF PLAN
+# =============================================================================

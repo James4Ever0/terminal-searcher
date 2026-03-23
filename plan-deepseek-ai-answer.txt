@@ -1,0 +1,323 @@
+### Existing Tools
+
+There are several terminal emulator web applications, but none combine **all** the features you’ve listed. Here’s a brief overview of existing solutions:
+
+| Tool | Features |
+|------|----------|
+| **ttyd** | Simple WebSocket-based terminal with basic sharing, but no history logging, AI search, screenshots, or session recovery. |
+| **wetty** | Similar to ttyd, uses WebSocket and xterm.js. No built-in history or advanced features. |
+| **Terminal for Jupyter** | Allows multiple terminals, but no persistent logging, screenshots, or AI search. |
+| **WebSSH** (various implementations) | Web-based SSH clients, typically focus on authentication, not session history or AI. |
+| **Tabby / Terminus** | Desktop terminal apps with some web features, but not designed as a recoverable web service with AI and screenshot logging. |
+
+Given that your requirements go well beyond what’s available, a custom implementation is the right approach.
+
+---
+
+## System Design Plan
+
+### 1. Overview
+
+We’ll build a modular system consisting of:
+
+- **Frontend**: Single-page application (SPA) using xterm.js for terminal rendering, plus UI controls for tabs, search, profile selection, and session recovery.
+- **Backend**: Python web server (FastAPI recommended for async WebSocket support) that manages terminal sessions, profiles, history logging, screenshots, embeddings, and search.
+- **Storage**: SQLite (or PostgreSQL) for relational data (sessions, profiles, history metadata, screenshots metadata); file system for terminal logs, screenshot images, and embedding vectors.
+
+The system will be **recoverable** – each terminal session is logged and can be replayed or restored with working directory.
+
+### 2. Project Structure
+
+```
+project/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py               # FastAPI app, WebSocket endpoint
+│   │   ├── config.py             # Configuration loader
+│   │   ├── models/               # SQLAlchemy or plain SQL models
+│   │   ├── services/             # Business logic modules
+│   │   │   ├── terminal_manager.py  # Spawns PTY processes, routes I/O
+│   │   │   ├── profile_manager.py   # Loads/validates profiles
+│   │   │   ├── history_logger.py    # Records terminal output
+│   │   │   ├── screenshot_capturer.py# Captures terminal frames
+│   │   │   ├── embedding_service.py # Optional: generates embeddings
+│   │   │   ├── search_engine.py     # Text & semantic search
+│   │   │   ├── session_recovery.py  # Restores sessions
+│   │   │   └── utils.py
+│   │   ├── api/
+│   │   │   ├── websocket.py      # WebSocket handler for terminal I/O
+│   │   │   └── rest.py           # REST endpoints for tabs, search, profiles
+│   │   └── static/               # Served frontend files
+│   ├── logs/                     # Terminal raw logs
+│   ├── screenshots/              # PNG/JPEG images
+│   ├── embeddings/               # Vector files (optional)
+│   ├── config.yaml               # Configuration file
+│   ├── requirements.txt
+│   └── run.py                    # Entry point
+├── frontend/
+│   ├── index.html
+│   ├── app.js                    # xterm.js setup, WebSocket connection
+│   ├── style.css
+│   └── lib/                      # xterm.js, other frontend libraries
+└── README.md
+```
+
+### 3. Configuration File Layout (`config.yaml`)
+
+```yaml
+general:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+
+storage:
+  log_dir: "./logs"
+  screenshot_dir: "./screenshots"
+  embedding_dir: "./embeddings"
+  db_url: "sqlite:///./terminal.db"  # or postgresql://...
+
+history:
+  enabled: true
+  retention_days: 10
+  compress: false
+
+screenshots:
+  enabled: true
+  interval_seconds: 10
+  max_per_session: 0  # 0 = unlimited
+
+embedding:
+  enabled: false
+  model: "all-MiniLM-L6-v2"  # sentence-transformers model
+  device: "cpu"
+
+profiles:
+  - name: "default"
+    command: "/bin/bash"
+    args: []
+    env: {}
+    cwd: "/home/user"
+    description: "Standard bash shell"
+  - name: "python"
+    command: "/usr/bin/python3"
+    args: ["-i"]
+    env: {}
+    cwd: "/home/user"
+    description: "Python interactive shell"
+  - name: "ssh-server"
+    command: "ssh"
+    args: ["user@example.com"]
+    env: {}
+    cwd: "/home/user"
+    description: "SSH to remote server"
+
+search:
+  text_search_enabled: true
+  semantic_search_enabled: false   # depends on embedding
+  max_results: 50
+
+session_recovery:
+  enabled: true
+  max_recovery_age_days: 30
+```
+
+### 4. Backend API Design
+
+#### 4.1 WebSocket Endpoint
+
+**Path:** `/ws/terminal/{session_id}`
+
+- **Connection**: Client opens WebSocket with `session_id`. If new session, server creates a new terminal process.
+- **Messages** (JSON or raw):
+  - Client → Server:
+    - `{type: "input", data: "<string>"}` – terminal input (keys)
+    - `{type: "resize", rows: number, cols: number}` – terminal resize
+    - `{type: "command", cmd: "rename", new_name: string}` – rename tab
+    - `{type: "command", cmd: "search", ...}` – can also be done via REST, but could be WebSocket for streaming results
+  - Server → Client:
+    - `{type: "output", data: "<string>"}` – terminal output
+    - `{type: "error", message: string}`
+    - `{type: "info", ...}` – session events
+- **State**: Server maintains a PTY process per session, logs all output, and optionally triggers screenshots.
+
+#### 4.2 REST API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/sessions` | List all active/historical sessions (with pagination) |
+| POST | `/api/sessions` | Create a new terminal session (returns session_id) |
+| GET | `/api/sessions/{session_id}` | Get session metadata (name, profile, start time, last cwd, etc.) |
+| PUT | `/api/sessions/{session_id}` | Update session (e.g., rename) |
+| DELETE | `/api/sessions/{session_id}` | Terminate session |
+| POST | `/api/sessions/{session_id}/restore` | Restore a previous session (returns new session_id or reuses if active) |
+| GET | `/api/profiles` | List available terminal profiles |
+| POST | `/api/profiles` | Add/update profile (admin only) |
+| POST | `/api/search` | Search across terminal histories (text and/or semantic) |
+| GET | `/api/history/{session_id}` | Get full history of a session (maybe paginated) |
+| GET | `/api/screenshots/{session_id}` | List screenshots for a session (timestamps, URLs) |
+| GET | `/api/screenshots/{session_id}/{timestamp}` | Download screenshot image |
+
+**Example request bodies:**
+
+- **Create session**: `{ "profile": "default", "name": "My Terminal", "cwd": "/home/user" }`
+- **Search**: `{ "query": "git commit", "mode": "text", "scope": "all", "limit": 50 }`  
+  `mode` can be `text` or `semantic`, `scope` can be `current`, `all`, or specific session IDs.
+
+### 5. Core Components (Detailed)
+
+#### 5.1 Terminal Manager
+- Spawns a PTY (pseudo-terminal) process using `pty` and `subprocess`.
+- For each session, it maintains:
+  - PTY file descriptor
+  - WebSocket connection
+  - Output buffer (for logging)
+  - Current working directory (tracked by parsing output or using `os.getcwd` via custom command injection – e.g., `pwd` on each prompt detection).
+- Sends output to WebSocket and to **History Logger**.
+- Handles resize signals.
+
+#### 5.2 History Logger
+- Listens to terminal output streams.
+- Writes raw data to a file: `logs/session_<id>.log` (plain text, optionally compressed).
+- Also writes to database: entry per line? Better to store offsets for efficient search. We'll store each chunk with timestamp, session_id, and optionally a line index if we want to parse later.
+- For search, we need a full-text index. Could use SQLite FTS5 or PostgreSQL full-text search.
+- **Optional** if disabled, no logging.
+
+#### 5.3 Screenshot Capturer
+- Periodically (every `interval_seconds`) captures the terminal content.
+- Uses the xterm.js frontend to send a screenshot? That would be client-side capture. But requirement says "creating limited screenshots" – likely meaning the server captures the terminal's display state. This is tricky because the server only sees raw output, not rendered layout.
+- Alternative: The frontend captures its canvas every N seconds and sends the image to the server via REST or WebSocket. This is more practical and gives true WYSIWYG screenshots. The backend then stores it.
+- Configurable interval, optional.
+
+#### 5.4 Embedding Service
+- Generates vector embeddings for terminal output chunks (or per line) using a sentence-transformers model.
+- Only runs if enabled in config.
+- Stores embeddings in a vector database (e.g., Chroma, FAISS, or SQLite with vector extension) along with reference to session and timestamp.
+- For semantic search, the query is embedded and similarity search performed.
+
+#### 5.5 Search Engine
+- Text search: uses database full-text index (FTS5 or PostgreSQL tsvector) over session logs.
+- Semantic search: queries vector store (if embedding service enabled) and returns matching chunks.
+- Combined search: can run both and merge results.
+
+#### 5.6 Session Recovery
+- When restoring a session:
+  - Retrieve all logged output for that session (from history log).
+  - Send it to the client with a special marker to "display history on top" (xterm.js supports writing lines).
+  - Attempt to change working directory: if the previous session's last known working directory is stored (tracked via parsing `PWD` or custom prompt injection), we try to `cd` to it after replaying history. If it fails, display error message.
+- The restore action creates a new active session (or reuses an existing one if the previous is still alive? Usually we'd create a new session that inherits the log).
+- We store last working directory per session (updated on each command that changes directory, by looking for `cd` or `pushd` etc. Or simpler: periodically send `pwd` via the backend and parse output).
+
+#### 5.7 Profile Manager
+- Reads profiles from config.
+- When creating a terminal, it uses the chosen profile's command, args, env, cwd.
+- Profiles can be created/updated via API (optional, for admin).
+- Each session remembers its profile name.
+
+### 6. Database Schema (Simplified)
+
+Using SQLAlchemy or plain SQL:
+
+```sql
+-- sessions
+CREATE TABLE sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid TEXT UNIQUE NOT NULL,
+    name TEXT,
+    profile_name TEXT,
+    start_time DATETIME,
+    end_time DATETIME,
+    last_cwd TEXT,
+    status TEXT,  -- 'active', 'closed'
+    metadata JSON
+);
+
+-- terminal_output (for full-text search)
+CREATE VIRTUAL TABLE terminal_output_fts USING fts5(
+    session_id, timestamp, content
+);
+
+-- Alternatively, use a normal table with full-text index on content.
+CREATE TABLE terminal_output (
+    id INTEGER PRIMARY KEY,
+    session_id INTEGER REFERENCES sessions(id),
+    timestamp DATETIME,
+    content TEXT
+);
+
+CREATE INDEX idx_terminal_output_session ON terminal_output(session_id);
+CREATE INDEX idx_terminal_output_timestamp ON terminal_output(timestamp);
+
+-- screenshots
+CREATE TABLE screenshots (
+    id INTEGER PRIMARY KEY,
+    session_id INTEGER REFERENCES sessions(id),
+    timestamp DATETIME,
+    file_path TEXT,
+    width INTEGER,
+    height INTEGER
+);
+
+-- embeddings (if using external vector DB, maybe not needed in relational)
+-- Could store references to vector DB ids.
+```
+
+### 7. Frontend Architecture
+
+- **HTML/CSS**: Container for xterm.js, plus a tab bar, a search panel, a profile dropdown, settings.
+- **xterm.js**:
+  - Attach to WebSocket (or use xterm-addon-attach).
+  - Resize addon.
+  - Fit addon for responsive layout.
+  - Custom addon for screenshot capture: draw canvas to image and send via WebSocket or REST.
+- **State management**: Simple JavaScript object to track active tabs (each tab is a separate WebSocket connection to a session). Each tab has its own xterm instance.
+- **Search UI**: Modal or sidebar that allows query entry, scope selection (current tab / all tabs / specific sessions), and displays results with timestamps and ability to jump to that point in the terminal (by replaying or highlighting).
+- **Restore UI**: List of previous sessions (with search/filter) and a "Restore" button.
+
+### 8. Modularity and Optional Features
+
+- Each core service (HistoryLogger, ScreenshotCapturer, EmbeddingService) should be loaded dynamically based on config.
+- Use dependency injection or factory pattern to create services.
+- For optional features like semantic search, the frontend can conditionally enable the semantic search toggle only if the backend reports it's available.
+- History retention: a background job (e.g., APScheduler) runs daily to delete logs older than `retention_days` and update database.
+
+### 9. Dependencies (Python)
+
+- **FastAPI** – web framework with async WebSocket.
+- **uvicorn** – ASGI server.
+- **sqlalchemy** – ORM (optional, but convenient).
+- **aiosqlite** / **asyncpg** – async DB drivers.
+- **python-pty** – for PTY handling (or `pty` built-in).
+- **websockets** – already part of FastAPI.
+- **sentence-transformers** – for embeddings (optional).
+- **chromadb** / **faiss-cpu** – vector DB (optional).
+- **pyyaml** – config parsing.
+- **apscheduler** – scheduled jobs.
+- **Pillow** – image handling (if server generates screenshots, but we likely delegate to frontend).
+- **python-multipart** – for file uploads (screenshots from frontend).
+
+### 10. Security Considerations
+
+- Authentication (optional but recommended) – add JWT or OAuth2.
+- Each terminal session runs as the user running the backend process. For multi-user, consider isolating processes (e.g., using `pty` with different user IDs, but that's complex).
+- WebSocket should be authenticated.
+- Protect REST endpoints with authentication.
+- Validate profiles to avoid command injection.
+
+### 11. Implementation Phases (Suggested)
+
+1. **Basic terminal** – WebSocket connection, PTY, xterm.js, no extras.
+2. **Multiple tabs** – Frontend manages multiple WebSocket connections.
+3. **Profiles** – Load from config, allow selection.
+4. **History logging** – Write raw output to file and DB, full-text search.
+5. **Session restore** – Replay history and attempt cd.
+6. **Screenshots** – Frontend canvas capture every N seconds, upload.
+7. **Semantic search** – Embedding generation, vector storage, search API.
+8. **Configurability and modularization** – Make all features optional via config.
+9. **Retention cleanup** – Scheduled job.
+
+---
+
+### Conclusion
+
+The proposed design is modular, extensible, and covers all requested features. It leverages existing libraries (FastAPI, xterm.js) while implementing custom logic for terminal session management, history logging, AI search, and session recovery. By using a configuration-driven approach, users can enable/disable features as needed. The system can be built incrementally, starting with a basic terminal and adding advanced features.

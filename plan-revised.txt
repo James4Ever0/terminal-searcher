@@ -1,0 +1,3209 @@
+# flashback-terminal - Revised Executable Plan
+# PyPI Package: flashback-terminal
+# CLI Command: flashback-terminal
+# =============================================================================
+
+# =============================================================================
+# PROJECT STRUCTURE
+# =============================================================================
+"""
+flashback_terminal/
+├── pyproject.toml              # Package metadata, entry points
+├── README.md
+├── config.yaml                 # Default configuration template
+├── flashback_terminal/
+│   ├── __init__.py
+│   ├── __main__.py             # python -m flashback_terminal
+│   ├── cli.py                  # Click-based CLI commands
+│   ├── config.py               # Configuration loader (YAML)
+│   ├── deps.py                 # Dependency checker (pty, xterm.js deps)
+│   ├── database.py             # SQLite models and operations
+│   ├── server.py               # FastAPI + WebSocket server
+│   ├── terminal.py             # PTY management
+│   ├── search.py               # BM25 + embedding search
+│   ├── retention.py            # Archive/delete old sessions
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── websocket.py        # Terminal WebSocket handler
+│   │   └── rest.py             # REST endpoints
+│   ├── workers/
+│   │   ├── __init__.py
+│   │   ├── embedding_worker.py # Generate text embeddings (optional)
+│   │   ├── retention_worker.py # Scheduled cleanup/archival
+│   │   └── cwd_tracker.py      # Track working directory changes
+│   └── static/                 # Frontend assets
+│       ├── index.html
+│       ├── css/
+│       │   └── style.css
+│       └── js/
+│           ├── app.js          # Main application
+│           ├── terminal.js     # xterm.js wrapper
+│           ├── tabs.js         # Tab management
+│           ├── search.js       # Search UI
+│           └── screenshot.js   # Canvas capture
+└── tests/
+
+DATA DIRECTORY STRUCTURE:
+~/.local/share/flashback-terminal/
+├── config.yaml                 # User configuration
+├── terminal.db                 # SQLite database
+├── logs/                       # Terminal raw output logs
+│   └── {session_uuid}.log
+├── screenshots/                # Terminal screenshots (from frontend)
+│   └── {session_uuid}/
+│       └── {timestamp}.png
+├── embeddings/                 # Vector files (optional)
+│   └── {session_uuid}.npy
+└── archive/                    # Archived sessions
+    ├── archive.inprogress/     # Temporary during archive
+    └── 2024-01/                # Organized by month
+        └── archive-{from}-{to}.tar.gz
+"""
+
+# =============================================================================
+# SECTION 1: PYPROJECT.TOML
+# =============================================================================
+"""
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flashback-terminal"
+version = "0.1.0"
+description = "Recoverable web terminal with semantic search and session history"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["terminal", "xterm", "web-terminal", "session-recovery", "search"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "sqlalchemy>=2.0.0",
+    "aiosqlite>=0.19.0",
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "apscheduler>=3.10.0",
+    "python-multipart>=0.0.6",
+    "websockets>=12.0",
+    "rank-bm25>=0.2.2",
+    "nltk>=3.8",
+]
+
+[project.optional-dependencies]
+embedding = [
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+flashback-terminal = "flashback_terminal.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/flashback-terminal"
+Repository = "https://github.com/yourusername/flashback-terminal"
+Issues = "https://github.com/yourusername/flashback-terminal/issues"
+"""
+
+# DEPENDENCIES: See pyproject.toml above
+
+# =============================================================================
+# SECTION 2: YAML CONFIGURATION (config.yaml)
+# =============================================================================
+
+"""
+# config.yaml - User-editable configuration
+# Place in working directory or ~/.config/flashback-terminal/config.yaml
+
+# Data storage paths
+data_dir: "~/.local/share/flashback-terminal"
+
+# Server configuration
+server:
+  host: "127.0.0.1"
+  port: 8080
+  # WebSocket settings
+  ws_ping_interval: 20
+  ws_ping_timeout: 10
+
+# Terminal settings
+terminal:
+  # Default terminal size
+  rows: 24
+  cols: 80
+  # Shell to use (null = use $SHELL or /bin/bash)
+  shell: null
+  # Environment variables to set
+  env: {}
+  # Whether to use login shell (-l flag)
+  login_shell: true
+
+# Worker configuration - enable/disable and set intervals
+workers:
+  embedding:
+    enabled: false
+    work_interval_seconds: 1
+    batch_size: 10
+
+    # EMBEDDING MODE
+    # Options: 'text-only', 'disabled'
+    # Text embeddings are generated from terminal output for semantic search
+    mode: "text-only"
+
+    # TEXT EMBEDDING CONFIG
+    # Any OpenAI-compatible embedding API
+    text:
+      base_url: "https://api.openai.com/v1"
+      api_key: "${OPENAI_API_KEY}"
+      model: "text-embedding-3-small"
+      dimension: null  # REQUIRED: Run 'flashback-terminal config test-embedding --write'
+      extra_headers: {}
+
+    # Chunking settings
+    chunk_size: 512        # Characters per embedding chunk
+    chunk_overlap: 50      # Overlap between chunks
+
+  retention:
+    enabled: true
+    check_interval_seconds: 3600  # Check every hour
+
+    # Strategy: "delete" | "archive"
+    # - delete: Permanently remove old sessions
+    # - archive: Move to archive storage (can be restored later)
+    strategy: "archive"
+
+    # History retention period
+    history_days: 10
+
+    # Archive constraints (only used when strategy="archive")
+    archive:
+      # Max total size of all archives (bytes, 0 = unlimited)
+      total_size_limit: 10737418240  # 10 GB
+
+      # Max age of archives before forced deletion (days, 0 = unlimited)
+      max_age_days: 90
+
+      # Compression format: "gzip" | "bz2" | "xz" | null
+      compression: "gzip"
+
+      # Archive organization: "flat" | "monthly" | "yearly"
+      organization: "monthly"
+
+  cwd_tracker:
+    enabled: true
+    # Method: "pwd_injection" | "parse_prompt"
+    # - pwd_injection: Periodically send 'pwd' command to track cwd
+    # - parse_prompt: Try to parse cwd from shell prompt (shell-specific)
+    method: "pwd_injection"
+    injection_interval_ms: 5000
+
+# Module toggles (all features are optional)
+modules:
+  history_keeper:
+    enabled: true
+    # Buffer output in chunks for efficient storage/search
+    buffer_size_lines: 100
+    # Enable full-text search index
+    use_fts: true
+
+  screenshot_capture:
+    enabled: true
+    # Screenshots are captured by frontend and uploaded
+    # This controls server-side handling
+    max_per_session: 1000     # 0 = unlimited
+    max_file_size_mb: 5
+    formats: ["png", "jpeg"]
+
+  semantic_search:
+    enabled: false
+    # Requires workers.embedding.enabled = true
+    # Weight for text embedding in hybrid search
+    text_weight: 0.7
+    # BM25 weight in hybrid search
+    bm25_weight: 0.3
+    # RRF k value for fusion
+    rrf_k: 60
+
+  session_recovery:
+    enabled: true
+    # Max age of session that can be recovered (days)
+    max_recovery_age_days: 30
+    # Replay mode: "instant" | "animated"
+    replay_mode: "instant"
+
+# Search configuration
+search:
+  enabled_methods:
+    bm25: true
+    embedding: false
+    regex: true
+
+  bm25:
+    k1: 1.5
+    b: 0.75
+    default_limit: 50
+
+  embedding:
+    default_limit: 50
+
+  # Context lines around search matches
+  context_lines: 3
+
+# Web UI configuration
+webui:
+  enabled: true
+  # Theme: "dark" | "light" | "auto"
+  theme: "dark"
+  # Font settings for xterm.js
+  font_family: "'Courier New', monospace"
+  font_size: 14
+
+# Profile presets for new terminals
+profiles:
+  - name: "default"
+    shell: null           # Uses $SHELL
+    args: []
+    env: {}
+    cwd: "~"
+    description: "Standard shell"
+
+  - name: "python"
+    shell: "/usr/bin/python3"
+    args: ["-i"]
+    env:
+      PYTHONSTARTUP: "~/.pythonrc"
+    cwd: "~"
+    description: "Python REPL"
+
+# Feature flags
+features:
+  semantic_search: auto  # auto, true, or false
+  history_keeper: auto
+  screenshot_capture: auto
+
+# Validation settings
+validation:
+  check_embedding_dimension: true
+  halt_on_embedding_error: false
+"""
+
+# DEPENDENCIES: pyyaml
+
+# =============================================================================
+# SECTION 3: CONFIGURATION LOADER (config.py)
+# =============================================================================
+
+"""
+# flashback_terminal/config.py
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+# Base paths
+PACKAGE_DIR = Path(__file__).parent
+USER_CONFIG_DIR = Path.home() / ".config" / "flashback-terminal"
+USER_CONFIG_PATH = USER_CONFIG_DIR / "config.yaml"
+DATA_DIR = Path.home() / ".local" / "share" / "flashback-terminal"
+
+# Default configuration
+DEFAULT_CONFIG = {
+    "data_dir": str(DATA_DIR),
+    "server": {
+        "host": "127.0.0.1",
+        "port": 8080,
+        "ws_ping_interval": 20,
+        "ws_ping_timeout": 10,
+    },
+    "terminal": {
+        "rows": 24,
+        "cols": 80,
+        "shell": None,
+        "env": {},
+        "login_shell": True,
+    },
+    "workers": {
+        "embedding": {
+            "enabled": False,
+            "work_interval_seconds": 1,
+            "batch_size": 10,
+            "mode": "text-only",
+            "text": {
+                "base_url": "",
+                "api_key": "",
+                "model": "",
+                "dimension": None,
+                "extra_headers": {},
+            },
+            "chunk_size": 512,
+            "chunk_overlap": 50,
+        },
+        "retention": {
+            "enabled": True,
+            "check_interval_seconds": 3600,
+            "strategy": "archive",
+            "history_days": 10,
+            "archive": {
+                "total_size_limit": 10737418240,
+                "max_age_days": 90,
+                "compression": "gzip",
+                "organization": "monthly",
+            },
+        },
+        "cwd_tracker": {
+            "enabled": True,
+            "method": "pwd_injection",
+            "injection_interval_ms": 5000,
+        },
+    },
+    "modules": {
+        "history_keeper": {"enabled": True, "buffer_size_lines": 100, "use_fts": True},
+        "screenshot_capture": {"enabled": True, "max_per_session": 1000, "max_file_size_mb": 5, "formats": ["png", "jpeg"]},
+        "semantic_search": {"enabled": False, "text_weight": 0.7, "bm25_weight": 0.3, "rrf_k": 60},
+        "session_recovery": {"enabled": True, "max_recovery_age_days": 30, "replay_mode": "instant"},
+    },
+    "search": {
+        "enabled_methods": {"bm25": True, "embedding": False, "regex": True},
+        "bm25": {"k1": 1.5, "b": 0.75, "default_limit": 50},
+        "embedding": {"default_limit": 50},
+        "context_lines": 3,
+    },
+    "webui": {"enabled": True, "theme": "dark", "font_family": "'Courier New', monospace", "font_size": 14},
+    "profiles": [
+        {"name": "default", "shell": None, "args": [], "env": {}, "cwd": "~", "description": "Standard shell"},
+    ],
+    "validation": {"check_embedding_dimension": True, "halt_on_embedding_error": False},
+}
+
+
+class Config:
+    def __init__(self, config_path: Optional[Path] = None):
+        self._config_path = config_path
+        self._config = self._load_config()
+        self._validate()
+
+    def _load_config(self) -> Dict[str, Any]:
+        config = self._deep_copy(DEFAULT_CONFIG)
+
+        if not HAS_YAML:
+            print("[WARN] PyYAML not installed, using default config")
+            return config
+
+        # Load from file if exists
+        config_path = self._config_path
+        if config_path is None:
+            if USER_CONFIG_PATH.exists():
+                config_path = USER_CONFIG_PATH
+
+        if config_path and config_path.exists():
+            with open(config_path) as f:
+                user_config = yaml.safe_load(f)
+                if user_config:
+                    self._deep_merge(config, user_config)
+
+        return config
+
+    def _deep_copy(self, obj):
+        import copy
+        return copy.deepcopy(obj)
+
+    def _deep_merge(self, base: Dict, override: Dict):
+        for key, value in override.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._deep_merge(base[key], value)
+            elif key in base and isinstance(base[key], list) and isinstance(value, list):
+                base[key] = value  # Replace lists entirely
+            else:
+                base[key] = value
+
+    def _validate(self):
+        # Expand data directory path
+        data_dir = Path(self._config["data_dir"]).expanduser()
+        self._config["data_dir"] = str(data_dir)
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create subdirectories
+        self.log_dir = data_dir / "logs"
+        self.screenshot_dir = data_dir / "screenshots"
+        self.embedding_dir = data_dir / "embeddings"
+        self.archive_dir = data_dir / "archive"
+        self.db_path = data_dir / "terminal.db"
+
+        for d in [self.log_dir, self.screenshot_dir, self.embedding_dir, self.archive_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+    def get(self, key: str, default=None):
+        keys = key.split(".")
+        value = self._config
+        for k in keys:
+            if isinstance(value, dict):
+                value = value.get(k, default)
+            else:
+                return default
+            if value is None:
+                return default
+        return value
+
+    def is_module_enabled(self, module_name: str) -> bool:
+        return self.get(f"modules.{module_name}.enabled", True)
+
+    def is_worker_enabled(self, worker_name: str) -> bool:
+        return self.get(f"workers.{worker_name}.enabled", True)
+
+    def is_search_enabled(self, method: str) -> bool:
+        return self.get(f"search.enabled_methods.{method}", True)
+
+    def get_profile(self, name: str) -> Optional[Dict]:
+        profiles = self.get("profiles", [])
+        for p in profiles:
+            if p.get("name") == name:
+                return p
+        return profiles[0] if profiles else None
+
+    @property
+    def server_host(self) -> str:
+        return self.get("server.host", "127.0.0.1")
+
+    @property
+    def server_port(self) -> int:
+        return self.get("server.port", 8080)
+
+    @property
+    def retention_days(self) -> int:
+        return self.get("workers.retention.history_days", 10)
+
+
+# Global config instance
+_config_instance = None
+
+def get_config(config_path: Optional[Path] = None) -> Config:
+    global _config_instance
+    if _config_instance is None or config_path is not None:
+        _config_instance = Config(config_path)
+    return _config_instance
+"""
+
+# DEPENDENCIES: pyyaml
+
+# =============================================================================
+# SECTION 4: DATABASE SCHEMA (database.py)
+# =============================================================================
+
+"""
+# flashback_terminal/database.py
+import sqlite3
+import json
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from contextlib import contextmanager
+
+
+@dataclass
+class Session:
+    id: int
+    uuid: str
+    name: str
+    profile_name: str
+    created_at: datetime
+    updated_at: datetime
+    last_active_at: Optional[datetime]
+    ended_at: Optional[datetime]
+    last_cwd: Optional[str]
+    status: str  # 'active', 'inactive', 'archived'
+    metadata: Dict[str, Any]
+
+
+@dataclass
+class TerminalOutput:
+    id: int
+    session_id: int
+    timestamp: datetime
+    sequence_num: int
+    content: str
+    content_type: str  # 'output', 'input', 'system'
+
+
+@dataclass
+class Screenshot:
+    id: int
+    session_id: int
+    timestamp: datetime
+    file_path: str
+    file_size: int
+    width: int
+    height: int
+
+
+class Database:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.init_db()
+
+    @contextmanager
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def init_db(self):
+        with self._connect() as conn:
+            # Sessions table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uuid TEXT UNIQUE NOT NULL,
+                    name TEXT,
+                    profile_name TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active_at TIMESTAMP,
+                    ended_at TIMESTAMP,
+                    last_cwd TEXT,
+                    status TEXT DEFAULT 'active',
+                    metadata TEXT
+                )
+            """)
+
+            # Terminal output for replay and search
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS terminal_output (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    sequence_num INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    content_type TEXT DEFAULT 'output'
+                )
+            """)
+
+            # FTS5 virtual table for full-text search
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS terminal_output_fts USING fts5(
+                    content,
+                    content_rowid=rowid,
+                    tokenize='porter'
+                )
+            """)
+
+            # Triggers to keep FTS index in sync
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS terminal_output_ai AFTER INSERT ON terminal_output BEGIN
+                    INSERT INTO terminal_output_fts(rowid, content) VALUES (new.id, new.content);
+                END
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS terminal_output_ad AFTER DELETE ON terminal_output BEGIN
+                    INSERT INTO terminal_output_fts(terminal_output_fts, rowid, content) VALUES ('delete', old.id, old.content);
+                END
+            """)
+
+            # Screenshots
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS screenshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    file_path TEXT NOT NULL,
+                    file_size INTEGER,
+                    width INTEGER,
+                    height INTEGER
+                )
+            """)
+
+            # Embeddings reference
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    output_chunk_id INTEGER REFERENCES terminal_output(id) ON DELETE CASCADE,
+                    vector_id TEXT NOT NULL,
+                    model_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Archive manifest
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS archive_manifest (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_path TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    session_count INTEGER,
+                    output_count INTEGER,
+                    screenshot_count INTEGER,
+                    date_from TIMESTAMP,
+                    date_to TIMESTAMP,
+                    size_bytes INTEGER,
+                    compression TEXT
+                )
+            """)
+
+            # Indexes
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_output_session ON terminal_output(session_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_output_sequence ON terminal_output(session_id, sequence_num)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_screenshots_session ON screenshots(session_id)")
+
+            conn.commit()
+
+    def create_session(self, uuid: str, name: str, profile_name: str,
+                       metadata: Optional[Dict] = None) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO sessions (uuid, name, profile_name, metadata)
+                   VALUES (?, ?, ?, ?)""",
+                (uuid, name, profile_name, json.dumps(metadata or {}))
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_session(self, session_id: int) -> Optional[Session]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (session_id,)
+            ).fetchone()
+            if row:
+                return self._row_to_session(row)
+            return None
+
+    def get_session_by_uuid(self, uuid: str) -> Optional[Session]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE uuid = ?",
+                (uuid,)
+            ).fetchone()
+            if row:
+                return self._row_to_session(row)
+            return None
+
+    def update_session(self, session_id: int, **kwargs):
+        allowed = {'name', 'last_cwd', 'status', 'ended_at', 'last_active_at', 'metadata'}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        values = list(updates.values()) + [session_id]
+
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE sessions SET {set_clause} WHERE id = ?",
+                values
+            )
+            conn.commit()
+
+    def list_sessions(self, status: Optional[str] = None,
+                      limit: int = 100, offset: int = 0) -> List[Session]:
+        with self._connect() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM sessions WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (status, limit, offset)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM sessions ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset)
+                ).fetchall()
+            return [self._row_to_session(row) for row in rows]
+
+    def insert_terminal_output(self, session_id: int, sequence_num: int,
+                                content: str, content_type: str = 'output') -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO terminal_output (session_id, sequence_num, content, content_type)
+                   VALUES (?, ?, ?, ?)""",
+                (session_id, sequence_num, content, content_type)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_terminal_output(self, session_id: int,
+                            from_seq: Optional[int] = None,
+                            to_seq: Optional[int] = None) -> List[TerminalOutput]:
+        with self._connect() as conn:
+            if from_seq is not None and to_seq is not None:
+                rows = conn.execute(
+                    """SELECT * FROM terminal_output
+                       WHERE session_id = ? AND sequence_num BETWEEN ? AND ?
+                       ORDER BY sequence_num""",
+                    (session_id, from_seq, to_seq)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM terminal_output
+                       WHERE session_id = ? ORDER BY sequence_num""",
+                    (session_id,)
+                ).fetchall()
+            return [self._row_to_terminal_output(row) for row in rows]
+
+    def search_text(self, query: str, session_ids: Optional[List[int]] = None,
+                    limit: int = 50) -> List[Dict]:
+        with self._connect() as conn:
+            if session_ids:
+                placeholders = ','.join('?' * len(session_ids))
+                rows = conn.execute(f"""
+                    SELECT o.*, s.uuid as session_uuid, s.name as session_name
+                    FROM terminal_output_fts fts
+                    JOIN terminal_output o ON fts.rowid = o.id
+                    JOIN sessions s ON o.session_id = s.id
+                    WHERE terminal_output_fts MATCH ? AND s.id IN ({placeholders})
+                    ORDER BY rank
+                    LIMIT ?
+                """, (query, *session_ids, limit)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT o.*, s.uuid as session_uuid, s.name as session_name
+                    FROM terminal_output_fts fts
+                    JOIN terminal_output o ON fts.rowid = o.id
+                    JOIN sessions s ON o.session_id = s.id
+                    WHERE terminal_output_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                """, (query, limit)).fetchall()
+            return [dict(row) for row in rows]
+
+    def insert_screenshot(self, session_id: int, file_path: str,
+                          file_size: int, width: int, height: int) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO screenshots (session_id, file_path, file_size, width, height)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, file_path, file_size, width, height)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_screenshots(self, session_id: int, limit: int = 100) -> List[Screenshot]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM screenshots WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (session_id, limit)
+            ).fetchall()
+            return [self._row_to_screenshot(row) for row in rows]
+
+    def get_sessions_older_than(self, days: int) -> List[int]:
+        cutoff = datetime.now() - timedelta(days=days)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM sessions WHERE created_at < ? AND status != 'archived'",
+                (cutoff,)
+            ).fetchall()
+            return [row[0] for row in rows]
+
+    def delete_session(self, session_id: int):
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.commit()
+
+    def _row_to_session(self, row) -> Session:
+        return Session(
+            id=row['id'],
+            uuid=row['uuid'],
+            name=row['name'],
+            profile_name=row['profile_name'],
+            created_at=datetime.fromisoformat(row['created_at']),
+            updated_at=datetime.fromisoformat(row['updated_at']),
+            last_active_at=datetime.fromisoformat(row['last_active_at']) if row['last_active_at'] else None,
+            ended_at=datetime.fromisoformat(row['ended_at']) if row['ended_at'] else None,
+            last_cwd=row['last_cwd'],
+            status=row['status'],
+            metadata=json.loads(row['metadata'] or '{}')
+        )
+
+    def _row_to_terminal_output(self, row) -> TerminalOutput:
+        return TerminalOutput(
+            id=row['id'],
+            session_id=row['session_id'],
+            timestamp=datetime.fromisoformat(row['timestamp']),
+            sequence_num=row['sequence_num'],
+            content=row['content'],
+            content_type=row['content_type']
+        )
+
+    def _row_to_screenshot(self, row) -> Screenshot:
+        return Screenshot(
+            id=row['id'],
+            session_id=row['session_id'],
+            timestamp=datetime.fromisoformat(row['timestamp']),
+            file_path=row['file_path'],
+            file_size=row['file_size'],
+            width=row['width'],
+            height=row['height']
+        )
+"""
+
+# DEPENDENCIES: sqlite3 (built-in)
+
+# =============================================================================
+# SECTION 5: TERMINAL/PTY MANAGER (terminal.py)
+# =============================================================================
+
+"""
+# flashback_terminal/terminal.py
+import os
+import pty
+import select
+import struct
+import fcntl
+import termios
+import signal
+import asyncio
+from pathlib import Path
+from typing import Optional, Callable, Dict, Any
+import uuid as uuid_mod
+
+from flashback_terminal.database import Database
+from flashback_terminal.config import get_config
+
+
+class TerminalSession:
+    def __init__(self, session_id: int, uuid: str, db: Database,
+                 profile: Dict[str, Any], on_output: Optional[Callable] = None):
+        self.session_id = session_id
+        self.uuid = uuid
+        self.db = db
+        self.on_output = on_output
+        self.profile = profile
+
+        self.pid: Optional[int] = None
+        self.fd: Optional[int] = None
+        self.sequence_num = 0
+        self._cwd: Optional[str] = None
+        self._running = False
+        self._cwd_injection_timer = None
+
+    def start(self) -> bool:
+        config = get_config()
+
+        # Determine shell and arguments
+        shell = self.profile.get('shell') or os.environ.get('SHELL', '/bin/bash')
+        args = self.profile.get('args', [])
+        cwd = Path(self.profile.get('cwd', '~')).expanduser()
+        env = {**os.environ, **self.profile.get('env', {})}
+
+        if self.profile.get('login_shell', True):
+            shell_name = os.path.basename(shell)
+            args = [f'-{shell_name}'] + args
+
+        try:
+            self.pid, self.fd = pty.fork()
+
+            if self.pid == 0:
+                # Child process
+                os.chdir(cwd)
+                os.execvpe(shell, [shell] + args, env)
+            else:
+                # Parent process
+                self._running = True
+
+                # Set terminal size
+                self.resize(config.terminal.get('rows', 24),
+                           config.terminal.get('cols', 80))
+
+                # Start CWD tracker if enabled
+                if config.is_worker_enabled('cwd_tracker'):
+                    self._start_cwd_tracking()
+
+                return True
+        except Exception as e:
+            print(f"[TerminalSession] Failed to start: {e}")
+            return False
+
+    def resize(self, rows: int, cols: int):
+        if self.fd is not None:
+            try:
+                size = struct.pack('HHHH', rows, cols, 0, 0)
+                fcntl.ioctl(self.fd, termios.TIOCSWINSZ, size)
+            except Exception as e:
+                print(f"[TerminalSession] Resize error: {e}")
+
+    def write(self, data: str):
+        if self.fd is not None and self._running:
+            try:
+                os.write(self.fd, data.encode())
+            except Exception as e:
+                print(f"[TerminalSession] Write error: {e}")
+
+    def read(self, timeout: float = 0.1) -> Optional[str]:
+        if self.fd is None or not self._running:
+            return None
+
+        try:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if ready:
+                data = os.read(self.fd, 4096)
+                if data:
+                    text = data.decode('utf-8', errors='replace')
+                    self._log_output(text)
+                    return text
+                else:
+                    # EOF - process exited
+                    self._running = False
+        except Exception as e:
+            print(f"[TerminalSession] Read error: {e}")
+            self._running = False
+
+        return None
+
+    def _log_output(self, content: str):
+        config = get_config()
+
+        if config.is_module_enabled('history_keeper'):
+            self.sequence_num += 1
+            self.db.insert_terminal_output(
+                self.session_id, self.sequence_num, content, 'output'
+            )
+
+        if self.on_output:
+            self.on_output(content)
+
+    def _start_cwd_tracking(self):
+        config = get_config()
+        interval_ms = config.get('workers.cwd_tracker.injection_interval_ms', 5000)
+
+        async def inject_pwd():
+            while self._running:
+                await asyncio.sleep(interval_ms / 1000)
+                if self._running:
+                    # Send pwd command
+                    self.write(' pwd\n')
+
+        # Start in background
+        asyncio.create_task(inject_pwd())
+
+    def update_cwd(self, cwd: str):
+        self._cwd = cwd
+        self.db.update_session(self.session_id, last_cwd=cwd)
+
+    def get_cwd(self) -> Optional[str]:
+        return self._cwd
+
+    def is_running(self) -> bool:
+        if self.pid and self._running:
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+                if pid == 0:
+                    return True
+            except:
+                pass
+        return False
+
+    def stop(self):
+        self._running = False
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except:
+                pass
+        if self.fd:
+            try:
+                os.close(self.fd)
+            except:
+                pass
+
+
+class TerminalManager:
+    def __init__(self, db: Database):
+        self.db = db
+        self.sessions: Dict[str, TerminalSession] = {}
+        self.config = get_config()
+
+    def create_session(self, profile_name: str = 'default',
+                       name: Optional[str] = None) -> Optional[TerminalSession]:
+        profile = self.config.get_profile(profile_name)
+        if not profile:
+            print(f"[TerminalManager] Profile not found: {profile_name}")
+            return None
+
+        uuid_str = str(uuid_mod.uuid4())
+        session_name = name or f"Terminal {len(self.sessions) + 1}"
+
+        session_id = self.db.create_session(
+            uuid=uuid_str,
+            name=session_name,
+            profile_name=profile_name
+        )
+
+        session = TerminalSession(
+            session_id=session_id,
+            uuid=uuid_str,
+            db=self.db,
+            profile=profile
+        )
+
+        if session.start():
+            self.sessions[uuid_str] = session
+            return session
+        else:
+            self.db.delete_session(session_id)
+            return None
+
+    def get_session(self, uuid: str) -> Optional[TerminalSession]:
+        return self.sessions.get(uuid)
+
+    def close_session(self, uuid: str):
+        if uuid in self.sessions:
+            session = self.sessions[uuid]
+            session.stop()
+            self.db.update_session(
+                session.session_id,
+                status='inactive',
+                ended_at=datetime.now().isoformat()
+            )
+            del self.sessions[uuid]
+"""
+
+# DEPENDENCIES: pty, select, fcntl, termios, signal (built-in)
+
+# =============================================================================
+# SECTION 6: WEBSOCKET HANDLER (api/websocket.py)
+# =============================================================================
+
+"""
+# flashback_terminal/api/websocket.py
+import asyncio
+import json
+from typing import Dict, Optional
+from fastapi import WebSocket, WebSocketDisconnect
+
+from flashback_terminal.terminal import TerminalManager, TerminalSession
+from flashback_terminal.database import Database
+from flashback_terminal.config import get_config
+
+
+class TerminalWebSocketHandler:
+    def __init__(self, terminal_manager: TerminalManager, db: Database):
+        self.terminal_manager = terminal_manager
+        self.db = db
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def handle(self, websocket: WebSocket, session_uuid: str):
+        await websocket.accept()
+
+        config = get_config()
+
+        # Get or create session
+        session = self.terminal_manager.get_session(session_uuid)
+        if not session:
+            # Try to restore from DB
+            db_session = self.db.get_session_by_uuid(session_uuid)
+            if db_session and db_session.status == 'active':
+                # Reconnect to existing session (not implemented for now)
+                pass
+            else:
+                # Create new session
+                session = self.terminal_manager.create_session()
+                if session:
+                    session_uuid = session.uuid
+
+        if not session:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Failed to create terminal session"
+            })
+            await websocket.close()
+            return
+
+        self.active_connections[session_uuid] = websocket
+        session.on_output = lambda data: asyncio.create_task(
+            self._send_output(session_uuid, data)
+        )
+
+        # Send session info
+        await websocket.send_json({
+            "type": "session_info",
+            "uuid": session_uuid,
+            "name": session.db.get_session(session.session_id).name
+        })
+
+        # If recovery mode, replay history
+        if config.is_module_enabled('session_recovery'):
+            await self._replay_history(websocket, session.session_id)
+
+        # Try to restore CWD
+        if config.is_module_enabled('session_recovery'):
+            await self._restore_cwd(websocket, session)
+
+        try:
+            while True:
+                # Read from terminal
+                data = session.read(timeout=0.05)
+                if data:
+                    await self._send_output(session_uuid, data)
+
+                # Check for WebSocket messages (non-blocking)
+                try:
+                    message = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=0.05
+                    )
+                    await self._handle_message(websocket, session, message)
+                except asyncio.TimeoutError:
+                    pass
+
+                if not session.is_running():
+                    break
+
+        except WebSocketDisconnect:
+            pass
+        finally:
+            if session_uuid in self.active_connections:
+                del self.active_connections[session_uuid]
+            session.on_output = None
+
+    async def _send_output(self, session_uuid: str, data: str):
+        if session_uuid in self.active_connections:
+            websocket = self.active_connections[session_uuid]
+            await websocket.send_json({
+                "type": "output",
+                "data": data
+            })
+
+    async def _handle_message(self, websocket: WebSocket,
+                              session: TerminalSession, message: str):
+        try:
+            msg = json.loads(message)
+            msg_type = msg.get('type')
+
+            if msg_type == 'input':
+                session.write(msg.get('data', ''))
+
+            elif msg_type == 'resize':
+                session.resize(msg.get('rows', 24), msg.get('cols', 80))
+
+            elif msg_type == 'command':
+                cmd = msg.get('cmd')
+                if cmd == 'rename':
+                    session.db.update_session(
+                        session.session_id,
+                        name=msg.get('name', 'Unnamed')
+                    )
+                elif cmd == 'screenshot_upload':
+                    await self._handle_screenshot_upload(session, msg)
+
+        except json.JSONDecodeError:
+            # Raw input
+            session.write(message)
+
+    async def _handle_screenshot_upload(self, session: TerminalSession, msg: dict):
+        import base64
+        from pathlib import Path
+        from PIL import Image
+        from io import BytesIO
+
+        config = get_config()
+        timestamp = msg.get('timestamp')
+        image_data = msg.get('data', '')
+
+        if not image_data:
+            return
+
+        try:
+            # Decode base64
+            if ',' in image_data:
+                image_data = image_data.split(',')[1]
+            img_bytes = base64.b64decode(image_data)
+
+            # Validate image
+            img = Image.open(BytesIO(img_bytes))
+            width, height = img.size
+
+            # Check file size
+            max_size = config.get('modules.screenshot_capture.max_file_size_mb', 5)
+            if len(img_bytes) > max_size * 1024 * 1024:
+                return
+
+            # Save screenshot
+            screenshot_dir = Path(config.screenshot_dir) / session.uuid
+            screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+            filename = f"{timestamp or 'unknown'}.png"
+            filepath = screenshot_dir / filename
+
+            img.save(filepath, 'PNG')
+
+            # Record in database
+            session.db.insert_screenshot(
+                session_id=session.session_id,
+                file_path=str(filepath),
+                file_size=len(img_bytes),
+                width=width,
+                height=height
+            )
+
+        except Exception as e:
+            print(f"[WebSocket] Screenshot upload error: {e}")
+
+    async def _replay_history(self, websocket: WebSocket, session_id: int):
+        config = get_config()
+        max_age = config.get('modules.session_recovery.max_recovery_age_days', 30)
+
+        # Get session metadata
+        session = self.db.get_session(session_id)
+        if not session:
+            return
+
+        # Check age
+        from datetime import datetime
+        age_days = (datetime.now() - session.created_at).days
+        if age_days > max_age:
+            return
+
+        # Get terminal output
+        outputs = self.db.get_terminal_output(session_id)
+        if not outputs:
+            return
+
+        # Send in chunks for efficiency
+        chunk_size = 100
+        chunks = []
+        current_chunk = []
+
+        for output in outputs:
+            current_chunk.append({
+                'seq': output.sequence_num,
+                'content': output.content
+            })
+            if len(current_chunk) >= chunk_size:
+                chunks.append(current_chunk)
+                current_chunk = []
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        for i, chunk in enumerate(chunks):
+            await websocket.send_json({
+                "type": "history_replay",
+                "chunks": chunk,
+                "is_complete": i == len(chunks) - 1
+            })
+
+    async def _restore_cwd(self, websocket: WebSocket, session: TerminalSession):
+        config = get_config()
+        if not config.is_module_enabled('session_recovery'):
+            return
+
+        # Get last known CWD from DB
+        db_session = session.db.get_session(session.session_id)
+        last_cwd = db_session.last_cwd if db_session else None
+
+        if not last_cwd:
+            return
+
+        # Try to cd to the directory
+        import os
+        if os.path.isdir(last_cwd):
+            session.write(f'cd "{last_cwd}"\n')
+            await websocket.send_json({
+                "type": "cwd_change",
+                "path": last_cwd,
+                "success": True
+            })
+        else:
+            await websocket.send_json({
+                "type": "cwd_change",
+                "path": last_cwd,
+                "success": False,
+                "error": f"despite retries, we could not cd to {last_cwd}: No such file or directory"
+            })
+"""
+
+# DEPENDENCIES: fastapi, websockets, Pillow
+
+# =============================================================================
+# SECTION 7: RETENTION MANAGER (retention.py)
+# =============================================================================
+
+"""
+# flashback_terminal/retention.py
+import os
+import json
+import tarfile
+import shutil
+import hashlib
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+
+from flashback_terminal.database import Database
+from flashback_terminal.config import get_config
+
+
+class RetentionManager:
+    def __init__(self, db: Database):
+        self.db = db
+        self.config = get_config()
+
+    def run_cleanup(self):
+        config = self.config
+        retention_days = config.retention_days
+        strategy = config.get('workers.retention.strategy', 'archive')
+
+        print(f"[RetentionManager] Running cleanup (strategy: {strategy}, days: {retention_days})")
+
+        # Get old sessions
+        old_sessions = self.db.get_sessions_older_than(retention_days)
+
+        if not old_sessions:
+            print("[RetentionManager] No old sessions to process")
+            return
+
+        print(f"[RetentionManager] Found {len(old_sessions)} sessions to process")
+
+        if strategy == 'delete':
+            self._delete_sessions(old_sessions)
+        else:
+            self._archive_sessions(old_sessions)
+
+        # Check archive constraints
+        if strategy == 'archive':
+            self._enforce_archive_constraints()
+
+    def _delete_sessions(self, session_ids: List[int]):
+        for session_id in session_ids:
+            self._delete_session_data(session_id)
+            self.db.delete_session(session_id)
+            print(f"[RetentionManager] Deleted session {session_id}")
+
+    def _delete_session_data(self, session_id: int):
+        config = self.config
+        session = self.db.get_session(session_id)
+        if not session:
+            return
+
+        # Delete log file
+        log_file = Path(config.log_dir) / f"{session.uuid}.log"
+        if log_file.exists():
+            log_file.unlink()
+
+        # Delete screenshots
+        screenshot_dir = Path(config.screenshot_dir) / session.uuid
+        if screenshot_dir.exists():
+            shutil.rmtree(screenshot_dir)
+
+        # Delete embeddings
+        embedding_file = Path(config.embedding_dir) / f"{session.uuid}.npy"
+        if embedding_file.exists():
+            embedding_file.unlink()
+
+    def _archive_sessions(self, session_ids: List[int]):
+        if not session_ids:
+            return
+
+        config = self.config
+        archive_dir = Path(config.archive_dir)
+        organization = config.get('workers.retention.archive.organization', 'monthly')
+        compression = config.get('workers.retention.archive.compression', 'gzip')
+
+        # Create archive.inprogress directory
+        inprogress_dir = archive_dir / 'archive.inprogress'
+        inprogress_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        archive_name = f"archive-{timestamp}"
+        work_dir = inprogress_dir / archive_name
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Collect session data
+            sessions_data = []
+            output_count = 0
+            screenshot_count = 0
+            date_from = None
+            date_to = None
+
+            for session_id in session_ids:
+                session = self.db.get_session(session_id)
+                if not session:
+                    continue
+
+                session_data = self._archive_session(session, work_dir)
+                if session_data:
+                    sessions_data.append(session_data)
+                    output_count += session_data.get('output_count', 0)
+                    screenshot_count += session_data.get('screenshot_count', 0)
+
+                    # Track date range
+                    if date_from is None or session.created_at < date_from:
+                        date_from = session.created_at
+                    if date_to is None or session.created_at > date_to:
+                        date_to = session.created_at
+
+            if not sessions_data:
+                shutil.rmtree(work_dir)
+                return
+
+            # Write manifest
+            manifest = {
+                'created_at': datetime.now().isoformat(),
+                'date_from': date_from.isoformat() if date_from else None,
+                'date_to': date_to.isoformat() if date_to else None,
+                'session_count': len(sessions_data),
+                'output_count': output_count,
+                'screenshot_count': screenshot_count,
+                'sessions': sessions_data,
+                'checksums': self._calculate_checksums(work_dir)
+            }
+
+            manifest_path = work_dir / 'manifest.json'
+            with open(manifest_path, 'w') as f:
+                json.dump(manifest, f, indent=2)
+
+            # Compress archive
+            ext = {'gzip': '.tar.gz', 'bz2': '.tar.bz2', 'xz': '.tar.xz', None: '.tar'}.get(compression, '.tar.gz')
+            archive_filename = f"{archive_name}{ext}"
+
+            if organization == 'monthly':
+                month_dir = archive_dir / date_from.strftime('%Y-%m')
+            elif organization == 'yearly':
+                month_dir = archive_dir / date_from.strftime('%Y')
+            else:
+                month_dir = archive_dir
+
+            month_dir.mkdir(parents=True, exist_ok=True)
+            final_path = month_dir / archive_filename
+
+            # Create tar archive
+            mode = {'gzip': 'w:gz', 'bz2': 'w:bz2', 'xz': 'w:xz', None: 'w'}.get(compression, 'w:gz')
+            with tarfile.open(final_path, mode) as tar:
+                tar.add(work_dir, arcname=archive_name)
+
+            # Calculate final size
+            archive_size = final_path.stat().st_size
+
+            # Record in database
+            with self.db._connect() as conn:
+                conn.execute("""
+                    INSERT INTO archive_manifest
+                    (archive_path, session_count, output_count, screenshot_count,
+                     date_from, date_to, size_bytes, compression)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (str(final_path), len(sessions_data), output_count, screenshot_count,
+                      date_from, date_to, archive_size, compression))
+                conn.commit()
+
+            # Delete source data
+            for session_id in session_ids:
+                self._delete_session_data(session_id)
+                self.db.update_session(session_id, status='archived')
+
+            # Cleanup inprogress
+            shutil.rmtree(work_dir)
+
+            print(f"[RetentionManager] Archived {len(sessions_data)} sessions to {final_path}")
+
+        except Exception as e:
+            print(f"[RetentionManager] Archive failed: {e}")
+            # Leave inprogress for manual recovery
+            raise
+
+    def _archive_session(self, session, work_dir: Path) -> Optional[Dict]:
+        config = self.config
+        session_dir = work_dir / 'sessions' / session.uuid
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        # Export session metadata
+        session_data = {
+            'id': session.id,
+            'uuid': session.uuid,
+            'name': session.name,
+            'profile_name': session.profile_name,
+            'created_at': session.created_at.isoformat(),
+            'last_cwd': session.last_cwd,
+            'metadata': session.metadata,
+        }
+
+        with open(session_dir / 'metadata.json', 'w') as f:
+            json.dump(session_data, f, indent=2)
+
+        # Export terminal output
+        outputs = self.db.get_terminal_output(session.id)
+        output_count = len(outputs)
+
+        with open(session_dir / 'output.jsonl', 'w') as f:
+            for output in outputs:
+                f.write(json.dumps({
+                    'sequence_num': output.sequence_num,
+                    'timestamp': output.timestamp.isoformat(),
+                    'content': output.content,
+                    'content_type': output.content_type
+                }) + '\n')
+
+        # Copy screenshots
+        screenshot_dir = Path(config.screenshot_dir) / session.uuid
+        screenshot_count = 0
+
+        if screenshot_dir.exists():
+            dest_screenshot_dir = session_dir / 'screenshots'
+            dest_screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+            for img_file in screenshot_dir.iterdir():
+                if img_file.suffix in ['.png', '.jpg', '.jpeg']:
+                    shutil.copy2(img_file, dest_screenshot_dir / img_file.name)
+                    screenshot_count += 1
+
+        return {
+            'uuid': session.uuid,
+            'output_count': output_count,
+            'screenshot_count': screenshot_count
+        }
+
+    def _calculate_checksums(self, work_dir: Path) -> Dict[str, str]:
+        checksums = {}
+        for filepath in work_dir.rglob('*'):
+            if filepath.is_file():
+                rel_path = filepath.relative_to(work_dir)
+                sha256 = hashlib.sha256()
+                with open(filepath, 'rb') as f:
+                    for chunk in iter(lambda: f.read(8192), b''):
+                        sha256.update(chunk)
+                checksums[str(rel_path)] = sha256.hexdigest()
+        return checksums
+
+    def _enforce_archive_constraints(self):
+        config = self.config
+        max_size = config.get('workers.retention.archive.total_size_limit', 0)
+        max_age = config.get('workers.retention.archive.max_age_days', 0)
+
+        if max_size == 0 and max_age == 0:
+            return
+
+        archive_dir = Path(config.archive_dir)
+
+        # Get all archives from manifest
+        with self.db._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM archive_manifest ORDER BY created_at ASC"
+            ).fetchall()
+
+        total_size = sum(row['size_bytes'] for row in rows)
+        now = datetime.now()
+
+        for row in rows:
+            archive_path = Path(row['archive_path'])
+            should_delete = False
+
+            # Check age constraint
+            if max_age > 0:
+                archive_age_days = (now - datetime.fromisoformat(row['created_at'])).days
+                if archive_age_days > max_age:
+                    should_delete = True
+                    print(f"[RetentionManager] Archive exceeds max age: {archive_path}")
+
+            # Check size constraint
+            if max_size > 0 and total_size > max_size:
+                should_delete = True
+                print(f"[RetentionManager] Archive exceeds total size limit: {archive_path}")
+
+            if should_delete:
+                if archive_path.exists():
+                    archive_path.unlink()
+                total_size -= row['size_bytes']
+
+                with self.db._connect() as conn:
+                    conn.execute("DELETE FROM archive_manifest WHERE id = ?", (row['id'],))
+                    conn.commit()
+
+    def restore_session(self, archive_path: Path, uuid: str) -> bool:
+        """Restore a session from archive."""
+        if not archive_path.exists():
+            return False
+
+        config = self.config
+        work_dir = Path(config.archive_dir) / 'archive.inprogress' / 'restore'
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Extract archive
+            with tarfile.open(archive_path, 'r') as tar:
+                tar.extractall(work_dir)
+
+            # Find session in extracted archive
+            session_dir = None
+            for path in work_dir.rglob('sessions'):
+                if path.is_dir():
+                    session_dir = path / uuid
+                    break
+
+            if not session_dir or not session_dir.exists():
+                shutil.rmtree(work_dir)
+                return False
+
+            # Load metadata
+            with open(session_dir / 'metadata.json') as f:
+                metadata = json.load(f)
+
+            # Restore session to database
+            session_id = self.db.create_session(
+                uuid=metadata['uuid'],
+                name=metadata['name'],
+                profile_name=metadata['profile_name'],
+                metadata=metadata.get('metadata', {})
+            )
+
+            self.db.update_session(
+                session_id,
+                last_cwd=metadata.get('last_cwd'),
+                status='inactive'
+            )
+
+            # Restore terminal output
+            output_file = session_dir / 'output.jsonl'
+            if output_file.exists():
+                with open(output_file) as f:
+                    for line in f:
+                        record = json.loads(line)
+                        self.db.insert_terminal_output(
+                            session_id=session_id,
+                            sequence_num=record['sequence_num'],
+                            content=record['content'],
+                            content_type=record.get('content_type', 'output')
+                        )
+
+            # Restore screenshots
+            screenshot_dir = session_dir / 'screenshots'
+            if screenshot_dir.exists():
+                dest_dir = Path(config.screenshot_dir) / uuid
+                dest_dir.mkdir(parents=True, exist_ok=True)
+
+                for img_file in screenshot_dir.iterdir():
+                    shutil.copy2(img_file, dest_dir / img_file.name)
+
+            # Cleanup
+            shutil.rmtree(work_dir)
+
+            print(f"[RetentionManager] Restored session {uuid}")
+            return True
+
+        except Exception as e:
+            print(f"[RetentionManager] Restore failed: {e}")
+            if work_dir.exists():
+                shutil.rmtree(work_dir)
+            return False
+"""
+
+# DEPENDENCIES: tarfile, shutil, hashlib, json (built-in)
+
+# =============================================================================
+# SECTION 8: SEARCH MODULE (search.py)
+# =============================================================================
+
+"""
+# flashback_terminal/search.py
+import re
+import math
+from typing import List, Tuple, Dict, Optional
+from collections import defaultdict
+from pathlib import Path
+
+try:
+    import nltk
+    from nltk.tokenize import word_tokenize
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
+
+from flashback_terminal.database import Database
+from flashback_terminal.config import get_config
+
+
+class BM25Search:
+    """BM25 text search over terminal output."""
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.config = get_config()
+        self.k1 = self.config.get('search.bm25.k1', 1.5)
+        self.b = self.config.get('search.bm25.b', 0.75)
+        self._build_index()
+
+    def _tokenize(self, text: str) -> List[str]:
+        if NLTK_AVAILABLE:
+            return word_tokenize(text.lower())
+        return re.findall(r'\b\w+\b', text.lower())
+
+    def _build_index(self):
+        # Load all terminal output
+        with self.db._connect() as conn:
+            rows = conn.execute("""
+                SELECT id, session_id, content FROM terminal_output
+            """).fetchall()
+
+        self.documents = {}
+        self.doc_lengths = {}
+        self.inverted_index = defaultdict(list)
+        self.doc_freqs = defaultdict(int)
+
+        total_length = 0
+
+        for row in rows:
+            doc_id = row['id']
+            content = row['content']
+
+            tokens = self._tokenize(content)
+            self.documents[doc_id] = {
+                'session_id': row['session_id'],
+                'content': content
+            }
+            self.doc_lengths[doc_id] = len(tokens)
+            total_length += len(tokens)
+
+            # Build inverted index
+            term_counts = defaultdict(int)
+            for token in tokens:
+                term_counts[token] += 1
+
+            for term, freq in term_counts.items():
+                self.inverted_index[term].append((doc_id, freq))
+                self.doc_freqs[term] += 1
+
+        self.N = len(self.documents)
+        self.avg_dl = total_length / self.N if self.N > 0 else 0
+
+    def search(self, query: str, session_ids: Optional[List[int]] = None,
+               top_k: int = 50) -> List[Tuple[int, float]]:
+        query_terms = self._tokenize(query)
+        scores = defaultdict(float)
+
+        for term in query_terms:
+            if term not in self.inverted_index:
+                continue
+
+            df = self.doc_freqs[term]
+            idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1)
+
+            for doc_id, tf in self.inverted_index[term]:
+                # Filter by session if specified
+                if session_ids and self.documents[doc_id]['session_id'] not in session_ids:
+                    continue
+
+                dl = self.doc_lengths[doc_id]
+                denom = self.k1 * (1 - self.b + self.b * (dl / self.avg_dl)) + tf
+                score = idf * (tf * (self.k1 + 1)) / denom
+                scores[doc_id] += score
+
+        results = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return results[:top_k]
+
+
+class EmbeddingSearch:
+    """Semantic search using text embeddings via API."""
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.config = get_config()
+        self.api_config = self.config.get('workers.embedding.text', {})
+        self.dimension = self.api_config.get('dimension')
+
+        if not self.dimension:
+            raise RuntimeError(
+                "Embedding dimension not configured. "
+                "Run 'flashback-terminal config test-embedding --write'"
+            )
+
+    def _get_embedding(self, text: str) -> List[float]:
+        import requests
+        import os
+
+        base_url = self.api_config.get('base_url', '').rstrip('/')
+        url = f"{base_url}/embeddings"
+
+        headers = {"Content-Type": "application/json"}
+        api_key = self.api_config.get('api_key', '')
+
+        # Support env variable substitution
+        if api_key.startswith('${') and api_key.endswith('}'):
+            env_var = api_key[2:-1]
+            api_key = os.environ.get(env_var, '')
+
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "model": self.api_config.get('model'),
+            "input": text
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+
+        data = response.json()
+        return data["data"][0]["embedding"]
+
+    def search(self, query: str, session_ids: Optional[List[int]] = None,
+               top_k: int = 50) -> List[Tuple[int, float]]:
+        import numpy as np
+
+        # Get query embedding
+        query_vec = np.array(self._get_embedding(query), dtype=np.float32)
+        query_norm = np.linalg.norm(query_vec)
+
+        # Load stored embeddings
+        embedding_dir = Path(self.config.embedding_dir)
+        scores = []
+
+        for emb_file in embedding_dir.glob('*.npy'):
+            try:
+                emb = np.load(emb_file)
+                if len(emb) != self.dimension:
+                    continue
+
+                # Calculate cosine similarity
+                similarity = np.dot(query_vec, emb) / (query_norm * np.linalg.norm(emb))
+
+                # Extract session info from filename
+                session_uuid = emb_file.stem
+                session = self.db.get_session_by_uuid(session_uuid)
+                if session:
+                    if session_ids and session.id not in session_ids:
+                        continue
+                    scores.append((session.id, float(similarity)))
+            except Exception:
+                continue
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+
+def reciprocal_rank_fusion(*results_lists: List[List[Tuple[int, float]]],
+                           k: int = 60, top_k: int = 50) -> List[Tuple[int, float]]:
+    """Merge multiple result lists using Reciprocal Rank Fusion."""
+    fused_scores = defaultdict(float)
+
+    for results in results_lists:
+        for rank, (doc_id, _) in enumerate(results):
+            fused_scores[doc_id] += 1 / (k + rank + 1)
+
+    sorted_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+    return sorted_results[:top_k]
+
+
+class SearchEngine:
+    """Unified search combining BM25 and embedding search."""
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.config = get_config()
+        self.bm25 = BM25Search(db) if self.config.is_search_enabled('bm25') else None
+        self.embedding = None
+
+        if self.config.is_search_enabled('embedding'):
+            try:
+                self.embedding = EmbeddingSearch(db)
+            except Exception as e:
+                print(f"[SearchEngine] Embedding search not available: {e}")
+
+    def search(self, query: str, mode: str = 'text',
+               scope: str = 'all', session_ids: Optional[List[int]] = None,
+               limit: int = 50) -> List[Dict]:
+        """
+        Search terminal history.
+
+        Args:
+            query: Search query
+            mode: 'text' (BM25), 'semantic' (embedding), 'hybrid' (both)
+            scope: 'all', 'current', or list of session_ids
+            session_ids: Specific session IDs to search (for scope='current')
+            limit: Max results
+        """
+        config = self.config
+
+        # Determine which sessions to search
+        target_session_ids = None
+        if scope == 'current' and session_ids:
+            target_session_ids = session_ids
+
+        # Perform search based on mode
+        if mode == 'text':
+            if not self.bm25:
+                return []
+            results = self.bm25.search(query, target_session_ids, limit)
+
+        elif mode == 'semantic':
+            if not self.embedding:
+                return []
+            results = self.embedding.search(query, target_session_ids, limit)
+
+        elif mode == 'hybrid':
+            bm25_results = []
+            embedding_results = []
+
+            if self.bm25:
+                bm25_results = self.bm25.search(query, target_session_ids, limit * 2)
+            if self.embedding:
+                embedding_results = self.embedding.search(query, target_session_ids, limit * 2)
+
+            rrf_k = config.get('modules.semantic_search.rrf_k', 60)
+            results = reciprocal_rank_fusion(bm25_results, embedding_results, k=rrf_k, top_k=limit)
+
+        else:
+            raise ValueError(f"Unknown search mode: {mode}")
+
+        # Enrich results with session info
+        enriched = []
+        for doc_id, score in results:
+            output = self.db.get_terminal_output_by_id(doc_id)
+            if output:
+                session = self.db.get_session(output.session_id)
+                enriched.append({
+                    'output_id': doc_id,
+                    'session_id': output.session_id,
+                    'session_uuid': session.uuid if session else None,
+                    'session_name': session.name if session else None,
+                    'sequence_num': output.sequence_num,
+                    'timestamp': output.timestamp.isoformat(),
+                    'content': output.content,
+                    'score': score
+                })
+
+        return enriched
+"""
+
+# DEPENDENCIES: rank-bm25, nltk (optional), requests, numpy
+
+# =============================================================================
+# SECTION 9: FASTAPI APPLICATION (server.py)
+# =============================================================================
+
+"""
+# flashback_terminal/server.py
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Optional, List
+from pathlib import Path
+
+from fastapi import FastAPI, WebSocket, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+
+from flashback_terminal.database import Database
+from flashback_terminal.terminal import TerminalManager
+from flashback_terminal.api.websocket import TerminalWebSocketHandler
+from flashback_terminal.search import SearchEngine
+from flashback_terminal.config import get_config
+from flashback_terminal.retention import RetentionManager
+
+
+# Global instances
+db: Optional[Database] = None
+terminal_manager: Optional[TerminalManager] = None
+ws_handler: Optional[TerminalWebSocketHandler] = None
+search_engine: Optional[SearchEngine] = None
+retention_manager: Optional[RetentionManager] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    global db, terminal_manager, ws_handler, search_engine, retention_manager
+
+    config = get_config()
+
+    # Initialize database
+    db = Database(config.db_path)
+
+    # Initialize terminal manager
+    terminal_manager = TerminalManager(db)
+
+    # Initialize WebSocket handler
+    ws_handler = TerminalWebSocketHandler(terminal_manager, db)
+
+    # Initialize search engine
+    if config.is_module_enabled('history_keeper'):
+        search_engine = SearchEngine(db)
+
+    # Initialize retention manager
+    if config.is_worker_enabled('retention'):
+        retention_manager = RetentionManager(db)
+        # Schedule retention job
+        asyncio.create_task(retention_scheduler())
+
+    print("[Server] flashback-terminal started")
+    yield
+
+    # Cleanup
+    print("[Server] Shutting down...")
+
+
+async def retention_scheduler():
+    """Background task for retention management."""
+    config = get_config()
+    interval = config.get('workers.retention.check_interval_seconds', 3600)
+
+    while True:
+        await asyncio.sleep(interval)
+        if retention_manager:
+            retention_manager.run_cleanup()
+
+
+app = FastAPI(title="flashback-terminal", lifespan=lifespan)
+
+# Static files
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    """Serve the main terminal UI."""
+    index_path = static_dir / "index.html"
+    if index_path.exists():
+        return index_path.read_text()
+    return "<h1>flashback-terminal</h1><p>Static files not found</p>"
+
+
+@app.websocket("/ws/terminal/{session_uuid}")
+async def terminal_websocket(websocket: WebSocket, session_uuid: str):
+    """WebSocket endpoint for terminal sessions."""
+    if ws_handler:
+        await ws_handler.handle(websocket, session_uuid)
+
+
+# REST API Endpoints
+
+@app.get("/api/sessions")
+async def list_sessions(
+    status: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0)
+):
+    """List terminal sessions."""
+    sessions = db.list_sessions(status=status, limit=limit, offset=offset)
+    return {
+        "sessions": [
+            {
+                "id": s.id,
+                "uuid": s.uuid,
+                "name": s.name,
+                "profile_name": s.profile_name,
+                "created_at": s.created_at.isoformat(),
+                "status": s.status,
+                "last_cwd": s.last_cwd
+            }
+            for s in sessions
+        ]
+    }
+
+
+@app.post("/api/sessions")
+async def create_session(
+    profile: str = "default",
+    name: Optional[str] = None
+):
+    """Create a new terminal session."""
+    session = terminal_manager.create_session(profile_name=profile, name=name)
+    if not session:
+        raise HTTPException(status_code=500, detail="Failed to create session")
+
+    return {
+        "session_id": session.session_id,
+        "uuid": session.uuid,
+        "name": name or f"Terminal {session.session_id}"
+    }
+
+
+@app.get("/api/sessions/{session_uuid}")
+async def get_session(session_uuid: str):
+    """Get session details."""
+    session = db.get_session_by_uuid(session_uuid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return {
+        "id": session.id,
+        "uuid": session.uuid,
+        "name": session.name,
+        "profile_name": session.profile_name,
+        "created_at": session.created_at.isoformat(),
+        "status": session.status,
+        "last_cwd": session.last_cwd
+    }
+
+
+@app.put("/api/sessions/{session_uuid}")
+async def update_session(session_uuid: str, name: str):
+    """Update session (rename)."""
+    session = db.get_session_by_uuid(session_uuid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    db.update_session(session.id, name=name)
+    return {"success": True}
+
+
+@app.delete("/api/sessions/{session_uuid}")
+async def delete_session(session_uuid: str):
+    """Delete a session."""
+    session = db.get_session_by_uuid(session_uuid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Close if active
+    terminal_manager.close_session(session_uuid)
+
+    # Delete from DB
+    db.delete_session(session.id)
+    return {"success": True}
+
+
+@app.post("/api/sessions/{session_uuid}/restore")
+async def restore_session(session_uuid: str):
+    """Restore an archived session."""
+    # TODO: Implement archive restoration
+    raise HTTPException(status_code=501, detail="Archive restoration not yet implemented")
+
+
+@app.get("/api/profiles")
+async def list_profiles():
+    """List available terminal profiles."""
+    config = get_config()
+    profiles = config.get("profiles", [])
+    return {"profiles": profiles}
+
+
+@app.post("/api/search")
+async def search(
+    query: str,
+    mode: str = "text",
+    scope: str = "all",
+    session_ids: Optional[List[str]] = None,
+    limit: int = 50
+):
+    """Search terminal history."""
+    if not search_engine:
+        raise HTTPException(status_code=503, detail="Search not available")
+
+    # Resolve session UUIDs to IDs
+    target_session_ids = None
+    if scope == "current" and session_ids:
+        target_session_ids = []
+        for uuid in session_ids:
+            session = db.get_session_by_uuid(uuid)
+            if session:
+                target_session_ids.append(session.id)
+
+    results = search_engine.search(
+        query=query,
+        mode=mode,
+        scope=scope,
+        session_ids=target_session_ids,
+        limit=limit
+    )
+
+    return {
+        "query": query,
+        "mode": mode,
+        "results": results
+    }
+
+
+@app.get("/api/history/{session_uuid}")
+async def get_history(
+    session_uuid: str,
+    from_seq: Optional[int] = None,
+    to_seq: Optional[int] = None
+):
+    """Get terminal history for a session."""
+    session = db.get_session_by_uuid(session_uuid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    outputs = db.get_terminal_output(session.id, from_seq, to_seq)
+    return {
+        "session_uuid": session_uuid,
+        "outputs": [
+            {
+                "sequence_num": o.sequence_num,
+                "timestamp": o.timestamp.isoformat(),
+                "content": o.content,
+                "content_type": o.content_type
+            }
+            for o in outputs
+        ]
+    }
+
+
+@app.get("/api/screenshots/{session_uuid}")
+async def list_screenshots(session_uuid: str, limit: int = 100):
+    """List screenshots for a session."""
+    session = db.get_session_by_uuid(session_uuid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    screenshots = db.get_screenshots(session.id, limit)
+    return {
+        "session_uuid": session_uuid,
+        "screenshots": [
+            {
+                "id": s.id,
+                "timestamp": s.timestamp.isoformat(),
+                "file_path": s.file_path,
+                "width": s.width,
+                "height": s.height
+            }
+            for s in screenshots
+        ]
+    }
+
+
+@app.post("/api/retention/run")
+async def run_retention():
+    """Manually trigger retention cleanup."""
+    if not retention_manager:
+        raise HTTPException(status_code=503, detail="Retention not enabled")
+
+    retention_manager.run_cleanup()
+    return {"success": True}
+"""
+
+# DEPENDENCIES: fastapi, uvicorn, websockets
+
+# =============================================================================
+# SECTION 10: CLI ENTRY POINT (cli.py)
+# =============================================================================
+
+"""
+# flashback_terminal/cli.py
+import sys
+import signal
+from pathlib import Path
+
+import click
+import uvicorn
+
+from flashback_terminal.config import get_config, USER_CONFIG_PATH, USER_CONFIG_DIR
+from flashback_terminal.deps import DependencyChecker
+
+
+@click.group()
+@click.version_option(version="0.1.0")
+def cli():
+    """flashback-terminal - Recoverable web terminal with semantic search."""
+    pass
+
+
+@cli.command()
+@click.option('--host', default=None, help='Server host')
+@click.option('--port', default=None, type=int, help='Server port')
+@click.option('--config', '-c', type=click.Path(), help='Path to config file')
+def serve(host, port, config):
+    """Start the flashback-terminal server."""
+    # Load config
+    config_path = Path(config) if config else None
+    cfg = get_config(config_path)
+
+    # Check dependencies
+    DependencyChecker.check_all()
+
+    # Override with CLI options
+    server_host = host or cfg.server_host
+    server_port = port or cfg.server_port
+
+    click.echo(f"Starting flashback-terminal on http://{server_host}:{server_port}")
+
+    # Run server
+    from flashback_terminal.server import app
+    uvicorn.run(app, host=server_host, port=server_port)
+
+
+@cli.command()
+def init():
+    """Initialize flashback-terminal configuration."""
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if USER_CONFIG_PATH.exists():
+        click.echo(f"Config already exists at {USER_CONFIG_PATH}")
+        return
+
+    # Write default config
+    default_config = '''
+# flashback-terminal configuration
+data_dir: "~/.local/share/flashback-terminal"
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+
+terminal:
+  rows: 24
+  cols: 80
+  shell: null
+
+modules:
+  history_keeper:
+    enabled: true
+  screenshot_capture:
+    enabled: true
+  semantic_search:
+    enabled: false
+  session_recovery:
+    enabled: true
+
+workers:
+  retention:
+    enabled: true
+    history_days: 10
+    strategy: "archive"
+
+search:
+  enabled_methods:
+    bm25: true
+    embedding: false
+'''
+    USER_CONFIG_PATH.write_text(default_config)
+    click.echo(f"Created config at {USER_CONFIG_PATH}")
+
+
+@cli.command()
+@click.argument('action', type=click.Choice(['test-embedding']))
+@click.option('--type', 'embedding_type', type=click.Choice(['text', 'image']), default='text')
+@click.option('--write', '-w', is_flag=True, help='Write detected dimension to config')
+def config_cmd(action, embedding_type, write):
+    """Configuration utilities."""
+    if action == 'test-embedding':
+        _test_embedding(embedding_type, write)
+
+
+def _test_embedding(embedding_type: str, write: bool):
+    """Test embedding API and detect dimension."""
+    import requests
+    import os
+
+    cfg = get_config()
+
+    if embedding_type == 'text':
+        api_config = cfg.get('workers.embedding.text', {})
+    else:
+        click.echo("Image embedding not yet supported")
+        return
+
+    base_url = api_config.get('base_url', '')
+    model = api_config.get('model', '')
+    api_key = api_config.get('api_key', '')
+
+    if api_key.startswith('${') and api_key.endswith('}'):
+        api_key = os.environ.get(api_key[2:-1], '')
+
+    if not base_url:
+        click.echo("ERROR: base_url not configured")
+        return
+    if not model:
+        click.echo("ERROR: model not configured")
+        return
+
+    click.echo(f"Testing embedding API at {base_url}")
+    click.echo(f"Model: {model}")
+
+    try:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        response = requests.post(
+            f"{base_url}/embeddings",
+            headers=headers,
+            json={"model": model, "input": "test"},
+            timeout=60
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        dimension = len(data["data"][0]["embedding"])
+
+        click.echo(f"✓ API connection successful!")
+        click.echo(f"✓ Detected dimension: {dimension}")
+
+        if write:
+            # Update config file
+            import yaml
+
+            config_text = USER_CONFIG_PATH.read_text()
+            config = yaml.safe_load(config_text)
+
+            if embedding_type == 'text':
+                config['workers']['embedding']['text']['dimension'] = dimension
+
+            with open(USER_CONFIG_PATH, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False)
+
+            click.echo(f"✓ Wrote dimension to config file")
+
+    except Exception as e:
+        click.echo(f"✗ API test failed: {e}")
+
+
+@cli.command()
+def check():
+    """Check dependencies and configuration."""
+    DependencyChecker.check_all()
+    click.echo("All dependencies satisfied!")
+
+
+def main():
+    """Entry point for the CLI."""
+    cli()
+
+
+if __name__ == '__main__':
+    main()
+"""
+
+# DEPENDENCIES: click, uvicorn
+
+# =============================================================================
+# SECTION 11: DEPENDENCY CHECKER (deps.py)
+# =============================================================================
+
+"""
+# flashback_terminal/deps.py
+import shutil
+import sys
+from typing import List, Tuple
+
+from flashback_terminal.config import get_config
+
+
+class DependencyError(Exception):
+    def __init__(self, message: str, install_cmd: str):
+        self.message = message
+        self.install_cmd = install_cmd
+        super().__init__(message)
+
+    def __str__(self):
+        return f"""
+{'='*70}
+DEPENDENCY ERROR: {self.message}
+{'='*70}
+
+To fix this issue, run:
+
+    {self.install_cmd}
+
+{'='*70}
+"""
+
+
+class DependencyChecker:
+    @classmethod
+    def check_all(cls, skip_optional: bool = False):
+        """Check all dependencies."""
+        errors = []
+        config = get_config()
+
+        # Check for shell
+        shell = config.get('terminal.shell') or shutil.which('bash') or shutil.which('sh')
+        if not shell:
+            errors.append(DependencyError(
+                "No shell found (bash or sh required)",
+                "sudo apt-get install bash"
+            ))
+
+        # Check optional workers
+        if config.is_worker_enabled('embedding') and not skip_optional:
+            try:
+                import requests
+            except ImportError:
+                errors.append(DependencyError(
+                    "requests required for embedding worker",
+                    "pip install requests"
+                ))
+
+        if errors:
+            for e in errors:
+                print(e, file=sys.stderr)
+            sys.exit(1)
+
+        return True
+
+
+def check_python_module(module_name: str, pip_package: str = None) -> bool:
+    """Check if a Python module is installed."""
+    try:
+        __import__(module_name)
+        return True
+    except ImportError:
+        pkg = pip_package or module_name
+        print(f"[ERROR] Python module '{module_name}' not found")
+        print(f"[INFO] Install with: pip install {pkg}")
+        return False
+"""
+
+# DEPENDENCIES: None (built-in)
+
+# =============================================================================
+# SECTION 12: FRONTEND HTML (static/index.html)
+# =============================================================================
+
+"""
+<!-- static/index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>flashback-terminal</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+</head>
+<body>
+    <div id="app">
+        <div id="toolbar">
+            <div id="tabs"></div>
+            <div id="toolbar-buttons">
+                <button id="btn-new-tab">+ New Tab</button>
+                <button id="btn-search">Search</button>
+                <button id="btn-sessions">Sessions</button>
+            </div>
+        </div>
+        <div id="terminal-container"></div>
+    </div>
+
+    <!-- Search Modal -->
+    <div id="search-modal" class="modal hidden">
+        <div class="modal-content">
+            <span class="close-btn">&times;</span>
+            <h2>Search Terminal History</h2>
+            <input type="text" id="search-input" placeholder="Search...">
+            <select id="search-mode">
+                <option value="text">Text (BM25)</option>
+                <option value="semantic">Semantic</option>
+                <option value="hybrid">Hybrid</option>
+            </select>
+            <select id="search-scope">
+                <option value="current">Current Tab</option>
+                <option value="all">All Tabs</option>
+            </select>
+            <button id="btn-do-search">Search</button>
+            <div id="search-results"></div>
+        </div>
+    </div>
+
+    <!-- Sessions Modal -->
+    <div id="sessions-modal" class="modal hidden">
+        <div class="modal-content">
+            <span class="close-btn">&times;</span>
+            <h2>Sessions</h2>
+            <div id="sessions-list"></div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
+"""
+
+# =============================================================================
+# SECTION 13: FRONTEND JAVASCRIPT (static/js/app.js)
+# =============================================================================
+
+"""
+// static/js/app.js
+// Main application logic for flashback-terminal frontend
+
+class TerminalTab {
+    constructor(uuid, name) {
+        this.uuid = uuid;
+        this.name = name;
+        this.terminal = null;
+        this.socket = null;
+        this.fitAddon = null;
+        this.screenshotInterval = null;
+    }
+
+    async connect() {
+        // Initialize xterm.js
+        this.terminal = new Terminal({
+            fontFamily: "'Courier New', monospace",
+            fontSize: 14,
+            theme: {
+                background: '#1a1a1a',
+                foreground: '#eee'
+            }
+        });
+
+        this.fitAddon = new FitAddon.FitAddon();
+        this.terminal.loadAddon(this.fitAddon);
+
+        // Mount terminal
+        const container = document.getElementById('terminal-container');
+        this.terminal.open(container);
+        this.fitAddon.fit();
+
+        // Connect WebSocket
+        const wsUrl = `ws://${window.location.host}/ws/terminal/${this.uuid}`;
+        this.socket = new WebSocket(wsUrl);
+
+        this.socket.onopen = () => {
+            console.log('WebSocket connected');
+            this.startScreenshotCapture();
+        };
+
+        this.socket.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            this.handleMessage(msg);
+        };
+
+        this.socket.onclose = () => {
+            console.log('WebSocket closed');
+            this.stopScreenshotCapture();
+        };
+
+        // Terminal input
+        this.terminal.onData((data) => {
+            if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                this.socket.send(JSON.stringify({
+                    type: 'input',
+                    data: data
+                }));
+            }
+        });
+
+        // Resize handling
+        window.addEventListener('resize', () => {
+            this.fitAddon.fit();
+            this.sendResize();
+        });
+    }
+
+    handleMessage(msg) {
+        switch (msg.type) {
+            case 'output':
+                this.terminal.write(msg.data);
+                break;
+            case 'history_replay':
+                // Replay history
+                for (const chunk of msg.chunks) {
+                    this.terminal.write(chunk.content);
+                }
+                break;
+            case 'cwd_change':
+                if (!msg.success) {
+                    this.terminal.writeln(`\r\n[flashback] ${msg.error}`);
+                }
+                break;
+            case 'error':
+                this.terminal.writeln(`\r\n[Error] ${msg.message}`);
+                break;
+            case 'session_info':
+                this.uuid = msg.uuid;
+                this.name = msg.name;
+                break;
+        }
+    }
+
+    sendResize() {
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(JSON.stringify({
+                type: 'resize',
+                rows: this.terminal.rows,
+                cols: this.terminal.cols
+            }));
+        }
+    }
+
+    startScreenshotCapture() {
+        // Capture terminal canvas every 10 seconds
+        const interval = 10000;
+        this.screenshotInterval = setInterval(() => {
+            this.captureAndUpload();
+        }, interval);
+    }
+
+    stopScreenshotCapture() {
+        if (this.screenshotInterval) {
+            clearInterval(this.screenshotInterval);
+            this.screenshotInterval = null;
+        }
+    }
+
+    captureAndUpload() {
+        // Get canvas from xterm.js
+        const canvas = this.terminal.element.querySelector('canvas');
+        if (!canvas) return;
+
+        canvas.toBlob((blob) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const base64data = reader.result;
+                if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify({
+                        type: 'command',
+                        cmd: 'screenshot_upload',
+                        timestamp: new Date().toISOString(),
+                        data: base64data
+                    }));
+                }
+            };
+            reader.readAsDataURL(blob);
+        }, 'image/png');
+    }
+
+    focus() {
+        this.terminal.focus();
+    }
+
+    dispose() {
+        this.stopScreenshotCapture();
+        if (this.socket) {
+            this.socket.close();
+        }
+        this.terminal.dispose();
+    }
+}
+
+// Main application
+class App {
+    constructor() {
+        this.tabs = [];
+        this.activeTab = null;
+    }
+
+    async init() {
+        // Bind UI events
+        document.getElementById('btn-new-tab').addEventListener('click', () => this.createTab());
+        document.getElementById('btn-search').addEventListener('click', () => this.openSearch());
+        document.getElementById('btn-sessions').addEventListener('click', () => this.openSessions());
+
+        // Modal close buttons
+        document.querySelectorAll('.close-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.target.closest('.modal').classList.add('hidden');
+            });
+        });
+
+        // Search button
+        document.getElementById('btn-do-search').addEventListener('click', () => this.doSearch());
+
+        // Create initial tab
+        await this.createTab();
+    }
+
+    async createTab() {
+        // Create session via API
+        const response = await fetch('/api/sessions', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({profile: 'default'})
+        });
+        const data = await response.json();
+
+        const tab = new TerminalTab(data.uuid, data.name);
+        this.tabs.push(tab);
+        await tab.connect();
+        this.switchTab(tab);
+        this.renderTabs();
+    }
+
+    switchTab(tab) {
+        if (this.activeTab) {
+            this.activeTab.terminal.element.style.display = 'none';
+        }
+        this.activeTab = tab;
+        tab.terminal.element.style.display = 'block';
+        tab.focus();
+        this.renderTabs();
+    }
+
+    renderTabs() {
+        const container = document.getElementById('tabs');
+        container.innerHTML = '';
+
+        for (const tab of this.tabs) {
+            const tabEl = document.createElement('div');
+            tabEl.className = 'tab' + (tab === this.activeTab ? ' active' : '');
+            tabEl.textContent = tab.name;
+            tabEl.addEventListener('click', () => this.switchTab(tab));
+            container.appendChild(tabEl);
+        }
+    }
+
+    openSearch() {
+        document.getElementById('search-modal').classList.remove('hidden');
+    }
+
+    async doSearch() {
+        const query = document.getElementById('search-input').value;
+        const mode = document.getElementById('search-mode').value;
+        const scope = document.getElementById('search-scope').value;
+
+        const sessionIds = scope === 'current' && this.activeTab ? [this.activeTab.uuid] : [];
+
+        const response = await fetch('/api/search', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                query: query,
+                mode: mode,
+                scope: scope,
+                session_ids: sessionIds
+            })
+        });
+
+        const data = await response.json();
+        this.renderSearchResults(data.results);
+    }
+
+    renderSearchResults(results) {
+        const container = document.getElementById('search-results');
+        container.innerHTML = results.map(r => `
+            <div class="search-result">
+                <div class="result-header">
+                    <span class="session-name">${r.session_name}</span>
+                    <span class="timestamp">${r.timestamp}</span>
+                </div>
+                <pre class="result-content">${r.content.substring(0, 200)}...</pre>
+            </div>
+        `).join('');
+    }
+
+    async openSessions() {
+        document.getElementById('sessions-modal').classList.remove('hidden');
+
+        const response = await fetch('/api/sessions');
+        const data = await response.json();
+
+        const container = document.getElementById('sessions-list');
+        container.innerHTML = data.sessions.map(s => `
+            <div class="session-item">
+                <span>${s.name}</span>
+                <span class="status ${s.status}">${s.status}</span>
+                ${s.status === 'archived' ?
+                    `<button onclick="app.restoreSession('${s.uuid}')">Restore</button>` : ''}
+            </div>
+        `).join('');
+    }
+
+    async restoreSession(uuid) {
+        await fetch(`/api/sessions/${uuid}/restore`, {method: 'POST'});
+        this.openSessions(); // Refresh
+    }
+}
+
+// Start app
+const app = new App();
+app.init();
+"""
+
+# =============================================================================
+# SECTION 14: FRONTEND CSS (static/css/style.css)
+# =============================================================================
+
+"""
+/* static/css/style.css */
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #1a1a1a;
+    color: #eee;
+    height: 100vh;
+    overflow: hidden;
+}
+
+#app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+#toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #2a2a2a;
+    padding: 8px 16px;
+    border-bottom: 1px solid #333;
+}
+
+#tabs {
+    display: flex;
+    gap: 4px;
+}
+
+.tab {
+    padding: 8px 16px;
+    background: #333;
+    border-radius: 4px 4px 0 0;
+    cursor: pointer;
+    font-size: 14px;
+}
+
+.tab.active {
+    background: #444;
+}
+
+#toolbar-buttons {
+    display: flex;
+    gap: 8px;
+}
+
+button {
+    padding: 6px 12px;
+    background: #4a9;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+}
+
+button:hover {
+    background: #5ba;
+}
+
+#terminal-container {
+    flex: 1;
+    padding: 8px;
+    overflow: hidden;
+}
+
+.xterm {
+    height: 100%;
+}
+
+/* Modal styles */
+.modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.8);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.modal.hidden {
+    display: none;
+}
+
+.modal-content {
+    background: #2a2a2a;
+    padding: 24px;
+    border-radius: 8px;
+    min-width: 600px;
+    max-width: 90vw;
+    max-height: 80vh;
+    overflow: auto;
+}
+
+.close-btn {
+    float: right;
+    font-size: 24px;
+    cursor: pointer;
+}
+
+.close-btn:hover {
+    color: #f66;
+}
+
+/* Search styles */
+#search-input {
+    width: 100%;
+    padding: 8px;
+    margin: 8px 0;
+    background: #333;
+    color: #eee;
+    border: 1px solid #444;
+    border-radius: 4px;
+}
+
+#search-results {
+    margin-top: 16px;
+    max-height: 400px;
+    overflow: auto;
+}
+
+.search-result {
+    background: #333;
+    padding: 12px;
+    margin: 8px 0;
+    border-radius: 4px;
+}
+
+.result-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    font-size: 12px;
+    color: #888;
+}
+
+.result-content {
+    font-family: monospace;
+    font-size: 13px;
+    white-space: pre-wrap;
+    color: #ccc;
+}
+
+/* Session list styles */
+.session-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px;
+    background: #333;
+    margin: 8px 0;
+    border-radius: 4px;
+}
+
+.status {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.status.active {
+    background: #4a9;
+}
+
+.status.inactive {
+    background: #888;
+}
+
+.status.archived {
+    background: #a44;
+}
+"""
+
+# =============================================================================
+# SECTION 15: IMPLEMENTATION PHASES
+# =============================================================================
+
+"""
+Phase 1: Core Terminal (MVP)
+- Project structure and packaging (pyproject.toml)
+- Basic PTY + WebSocket integration
+- xterm.js frontend connection
+- Session creation and basic I/O
+
+Phase 2: Session Management
+- Multiple tabs in frontend
+- Session persistence in SQLite
+- Profile loading from config
+- Tab rename functionality
+
+Phase 3: History & Basic Search
+- HistoryLogger service integration
+- Raw log file storage
+- BM25 text search implementation
+- Search UI in frontend
+
+Phase 4: Session Recovery
+- History replay on reconnect
+- CWD tracking (pwd injection method)
+- CWD restoration with error message
+- Recovery age limits
+
+Phase 5: Screenshots
+- Frontend canvas capture (xterm.js)
+- Screenshot upload via WebSocket
+- Screenshot metadata storage
+- Screenshot browser UI
+
+Phase 6: Advanced Search (Optional)
+- Embedding service integration
+- OpenAI-compatible API client
+- Semantic search endpoint
+- Hybrid search (BM25 + embeddings)
+
+Phase 7: Retention System
+- RetentionManager with archive/delete
+- Safe archive workflow (.inprogress)
+- Archive compression and organization
+- Archive restoration
+- Constraint enforcement (size, age)
+
+Phase 8: Polish & Release
+- CLI commands (serve, init, config)
+- Configuration validation
+- Dependency checking
+- Documentation and README
+- PyPI package publication
+"""
+
+# =============================================================================
+# SECTION 16: DEPENDENCIES SUMMARY
+# =============================================================================
+
+"""
+Core Dependencies (required):
+- fastapi>=0.104.0          # Web framework
+- uvicorn[standard]>=0.24   # ASGI server
+- sqlalchemy>=2.0           # ORM
+- aiosqlite>=0.19           # Async SQLite
+- pyyaml>=6.0               # Config parsing
+- click>=8.0                # CLI framework
+- python-multipart>=0.0.6   # File uploads
+- websockets>=12.0          # WebSocket support
+- rank-bm25>=0.2.2          # BM25 text search
+- Pillow>=10.0              # Image handling
+
+Optional Dependencies:
+- requests>=2.31.0          # For embedding API calls
+- numpy>=1.24.0             # For embedding vectors
+- nltk>=3.8                 # For better text tokenization
+- apscheduler>=3.10         # For scheduled retention jobs
+
+Frontend (CDN):
+- xterm.js 5.3              # Terminal emulator
+- xterm-addon-fit 0.8       # Auto-resize
+
+System Dependencies:
+- bash or sh                # Shell for PTY
+
+Development:
+- pytest>=7.0
+- pytest-asyncio>=0.21
+- black>=23.0
+- ruff>=0.1.0
+"""
+
+# =============================================================================
+# END OF PLAN
+# =============================================================================
