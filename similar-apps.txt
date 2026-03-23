@@ -1,0 +1,1 @@
+tabby terminal can restore sessions as well, no history capture though.
