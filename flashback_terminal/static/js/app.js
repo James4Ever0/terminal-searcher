@@ -17,7 +17,9 @@ class TerminalTab {
             theme: {
                 background: '#1a1a1a',
                 foreground: '#eee'
-            }
+            },
+            cursorBlink: true,
+            convertEol: true
         });
 
         this.fitAddon = new FitAddon.FitAddon();
@@ -45,6 +47,7 @@ class TerminalTab {
             this.stopScreenshotCapture();
         };
 
+        // Send input to PTY - PTY will echo back for display
         this.terminal.onData((data) => {
             if (this.socket && this.socket.readyState === WebSocket.OPEN) {
                 this.socket.send(JSON.stringify({

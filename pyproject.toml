@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "Flashback Terminal Contributors"}
+    {name = "James Brown", email = "randomvoidmail@foxmail.com"}
 ]
 keywords = ["terminal", "xterm", "web-terminal", "session-recovery", "search"]
 classifiers = [
@@ -56,6 +56,6 @@ dev = [
 flashback-terminal = "flashback_terminal.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/flashback-terminal"
-Repository = "https://github.com/yourusername/flashback-terminal"
-Issues = "https://github.com/yourusername/flashback-terminal/issues"
+Homepage = "https://github.com/james4ever0/flashback-terminal"
+Repository = "https://github.com/james4ever0/flashback-terminal"
+Issues = "https://github.com/james4ever0/flashback-terminal/issues"

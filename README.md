@@ -23,7 +23,7 @@ pip install flashback-terminal
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/flashback-terminal.git
+git clone https://github.com/james4ever0/flashback-terminal.git
 cd flashback-terminal
 pip install -e .
 ```
@@ -31,7 +31,7 @@ pip install -e .
 ### Development Install
 
 ```bash
-git clone https://github.com/yourusername/flashback-terminal.git
+git clone https://github.com/james4ever0/flashback-terminal.git
 cd flashback-terminal
 pip install -e ".[dev]"
 ```

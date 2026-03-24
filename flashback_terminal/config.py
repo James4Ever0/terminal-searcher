@@ -21,7 +21,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "data_dir": str(DATA_DIR),
     "server": {
         "host": "127.0.0.1",
-        "port": 8080,
+        "port": 9090,
         "ws_ping_interval": 20,
         "ws_ping_timeout": 10,
     },

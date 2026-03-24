@@ -67,9 +67,8 @@ class TerminalWebSocketHandler:
 
         try:
             while True:
-                data = session.read(timeout=0.05)
-                if data:
-                    await self._send_output(session_uuid, data)
+                # Read from terminal - on_output callback handles WebSocket send
+                session.read(timeout=0.05)
 
                 try:
                     message = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
