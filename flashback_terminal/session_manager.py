@@ -287,6 +287,22 @@ class TmuxSession(BaseSession):
                 start_command,
             ])
 
+            self._run_tmux(["set-option", '-g', "default-terminal", "xterm-256color"])
+
+            # set -g status off
+            # set -g mouse on
+            self._run_tmux(["set-option", "-g", "status", "off"])
+            self._run_tmux(["set-option", "-g", "mouse", "on"])
+
+            # set-environment -r TMUX
+            self._run_tmux(["set-environment", "-r", "TMUX"])
+
+            # unbind "Ctrl b" normal
+            self._run_tmux(["unbind-key", "C-b"])
+
+            # unbind-key -a
+            self._run_tmux(["unbind-key", "-a"])
+
             # Set environment variables
             for key, value in profile_env.items():
                 self._run_tmux([

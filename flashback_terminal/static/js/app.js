@@ -70,8 +70,11 @@ class TerminalTab {
     }
 
     async connect() {
+        // TODO: add more visual feedback for connection details, like "connecting", "error from backend: xxx", "disconnected", "terminated"
         FrontendLogger.info(`Connecting terminal tab: uuid=${this.uuid}`);
         const exitLog = FrontendLogger.logFunction('TerminalTab.connect', { uuid: this.uuid });
+
+        // best way to see the cursor: turn dark reader off.
 
         this.terminal = new Terminal({
             fontFamily: "'Courier New', monospace",
@@ -97,6 +100,9 @@ class TerminalTab {
         this.socket.onopen = () => {
             FrontendLogger.info(`WebSocket connected: uuid=${this.uuid}`);
             this.startScreenshotCapture();
+            // resize terminal initially.
+            this.fitAddon.fit();
+            this.sendResize();
         };
 
         this.socket.onmessage = (event) => {
@@ -121,6 +127,11 @@ class TerminalTab {
         });
 
         window.addEventListener('resize', () => {
+            this.fitAddon.fit();
+            this.sendResize();
+        });
+
+        window.addEventListener('focus', () => {
             this.fitAddon.fit();
             this.sendResize();
         });
