@@ -18,6 +18,7 @@ from flashback_terminal.logger import Logger, log_function, logger
 from flashback_terminal.retention import RetentionManager
 from flashback_terminal.search import SearchEngine
 from flashback_terminal.terminal import TerminalManager
+from flashback_terminal.workers.capture_worker import CaptureWorkerScheduler
 
 # Global instances
 db: Optional[Database] = None
@@ -25,6 +26,7 @@ terminal_manager: Optional[TerminalManager] = None
 ws_handler: Optional[TerminalWebSocketHandler] = None
 search_engine: Optional[SearchEngine] = None
 retention_manager: Optional[RetentionManager] = None
+capture_scheduler: Optional[CaptureWorkerScheduler] = None
 
 
 class SearchRequest(BaseModel):
@@ -43,6 +45,11 @@ async def lifespan(app: FastAPI):
     logger.info("Starting flashback-terminal lifespan manager")
 
     config = get_config()
+    
+    if os.environ.get('CLI_VERBOSITY'):
+        config.set("logging.verbosity", int(os.environ.get('CLI_VERBOSITY')))
+        logger.debug(f"Using CLI verbosity: {config.verbosity}")
+
     logger.info(f"Configuration loaded: verbosity={config.verbosity}")
     logger.debug(f"Data directory: {config.data_dir}")
 
@@ -73,10 +80,23 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Retention worker disabled")
 
+    # Initialize capture scheduler for backend terminal capture
+    if config.get("session_manager.capture.enabled", True):
+        logger.info("Initializing capture scheduler...")
+        global capture_scheduler
+        capture_scheduler = CaptureWorkerScheduler(db)
+        capture_scheduler.start()
+        asyncio.create_task(capture_scheduler_task())
+        logger.info("Capture scheduler initialized")
+    else:
+        logger.warning("Capture scheduler disabled")
+
     logger.info("flashback-terminal startup complete")
     yield
 
     logger.info("Shutting down flashback-terminal...")
+    if capture_scheduler:
+        capture_scheduler.stop()
     logger.info("Shutdown complete")
 
 
@@ -89,6 +109,23 @@ async def retention_scheduler():
         await asyncio.sleep(interval)
         if retention_manager:
             retention_manager.run_cleanup()
+
+
+async def capture_scheduler_task():
+    """Background task for terminal capture."""
+    config = get_config()
+    interval = config.get("session_manager.capture.interval_seconds", 10)
+
+    logger.info(f"Capture scheduler running (interval: {interval}s)")
+    while True:
+        await asyncio.sleep(interval)
+        if capture_scheduler:
+            try:
+                results = capture_scheduler.run_captures()
+                if results:
+                    logger.debug(f"Captured {len(results)} sessions")
+            except Exception as e:
+                logger.error(f"Capture error: {e}")
 
 
 app = FastAPI(title="flashback-terminal", lifespan=lifespan)
@@ -108,6 +145,10 @@ async def index(request: Request):
     """Serve the main terminal UI with Jinja2 templating for verbosity."""
     config = get_config()
     verbosity = config.verbosity
+
+    if os.environ.get('CLI_VERBOSITY'):
+        verbosity = int(os.environ.get('CLI_VERBOSITY'))
+        logger.debug(f"Using CLI verbosity: {verbosity}")
 
     logger.debug(f"Serving index page with verbosity={verbosity}")
 
@@ -337,3 +378,146 @@ async def run_retention():
 
     retention_manager.run_cleanup()
     return {"success": True}
+
+
+# Timeline API endpoints
+@app.get("/api/v1/captures/timeline")
+@log_function(Logger.DEBUG)
+async def get_captures_timeline(
+    before_time: Optional[float] = None,
+    around_time: Optional[float] = None,
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Get terminal captures for timeline view."""
+    logger.debug(f"Timeline request: before={before_time}, around={around_time}, limit={limit}")
+
+    captures = db.get_terminal_captures_timeline(
+        before_time=before_time,
+        around_time=around_time,
+        limit=limit,
+    )
+
+    # Get total count
+    with db._connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM terminal_captures").fetchone()[0]
+        oldest = conn.execute(
+            "SELECT MIN(strftime('%s', timestamp)) FROM terminal_captures"
+        ).fetchone()[0]
+
+    # Format results
+    formatted = []
+    for c in captures:
+        formatted.append({
+            "id": c["id"],
+            "session_id": c["session_id"],
+            "session_uuid": c["session_uuid"],
+            "session_name": c["session_name"],
+            "timestamp": c["timestamp"],
+            "timestamp_formatted": c["timestamp"],
+            "screenshot_url": f"/api/v1/captures/{c['id']}/screenshot" if c["screenshot_path"] else None,
+            "ocr_text_preview": (c["text_content"] or "")[:200] if c["text_content"] else None,
+        })
+
+    return {
+        "results": formatted,
+        "total": total,
+        "oldest_timestamp": float(oldest) if oldest else None,
+        "time_from": captures[-1]["timestamp"] if captures else None,
+        "time_to": captures[0]["timestamp"] if captures else None,
+    }
+
+
+@app.get("/api/v1/captures/by-id/{capture_id}")
+async def get_capture_detail(capture_id: int):
+    """Get detailed information about a single capture."""
+    capture = db.get_terminal_capture_by_id(capture_id)
+    if not capture:
+        raise HTTPException(status_code=404, detail="Capture not found")
+
+    return {
+        "id": capture["id"],
+        "session_id": capture["session_id"],
+        "session_uuid": capture["session_uuid"],
+        "session_name": capture["session_name"],
+        "timestamp": capture["timestamp"],
+        "timestamp_formatted": capture["timestamp"],
+        "screenshot_url": f"/api/v1/captures/{capture_id}/screenshot" if capture["screenshot_path"] else None,
+        "ocr_text_full": capture["text_content"],
+        "ocr_text_preview": (capture["text_content"] or "")[:200] if capture["text_content"] else None,
+        "has_embedding": False,  # TODO: implement embedding check
+        "window_title": capture.get("session_name", "Terminal"),
+    }
+
+
+@app.get("/api/v1/captures/by-id/{capture_id}/neighbors")
+async def get_capture_neighbors(
+    capture_id: int,
+    before: int = Query(5, ge=0, le=20),
+    after: int = Query(5, ge=0, le=20),
+):
+    """Get neighboring captures for timeline context."""
+    neighbors = db.get_terminal_capture_neighbors(capture_id, before=before, after=after)
+
+    formatted = []
+    for n in neighbors:
+        # Calculate relative time in minutes
+        center_time = None
+        for x in neighbors:
+            if x.get("is_center"):
+                center_time = x["timestamp"]
+                break
+
+        rel_minutes = 0
+        if center_time and not n.get("is_center"):
+            # Parse timestamps and calculate difference
+            try:
+                from datetime import datetime
+                t1 = datetime.fromisoformat(center_time.replace("Z", "+00:00"))
+                t2 = datetime.fromisoformat(n["timestamp"].replace("Z", "+00:00"))
+                rel_minutes = int((t2 - t1).total_seconds() / 60)
+            except Exception:
+                pass
+
+        formatted.append({
+            "id": n["id"],
+            "timestamp": n["timestamp"],
+            "timestamp_formatted": n["timestamp"],
+            "screenshot_url": f"/api/v1/captures/{n['id']}/screenshot" if n["screenshot_path"] else None,
+            "is_center": n.get("is_center", False),
+            "relative_minutes": rel_minutes,
+        })
+
+    return {"screenshots": formatted}
+
+
+@app.get("/api/v1/captures/{capture_id}/screenshot")
+async def get_capture_screenshot(capture_id: int):
+    """Serve a capture screenshot."""
+    from fastapi.responses import FileResponse
+
+    capture = db.get_terminal_capture_by_id(capture_id)
+    if not capture or not capture.get("screenshot_path"):
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+
+    path = capture["screenshot_path"]
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Screenshot file not found")
+
+    return FileResponse(path, media_type="image/png")
+
+
+# Timeline and detail page routes
+@app.get("/timeline", response_class=HTMLResponse)
+async def timeline_page(request: Request):
+    """Serve the timeline page."""
+    return templates.TemplateResponse(request=request, name="timeline.html", context={})
+
+
+@app.get("/capture/{capture_id}", response_class=HTMLResponse)
+async def capture_detail_page(request: Request, capture_id: int):
+    """Serve the capture detail page."""
+    return templates.TemplateResponse(
+        request=request,
+        name="capture_detail.html",
+        context={"capture_id": capture_id},
+    )

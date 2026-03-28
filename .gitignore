@@ -9,6 +9,12 @@ __pycache__/
 # C extensions
 *.so
 
+
+*.bin
+*.png
+*.zip
+*.7z
+
 # Distribution / packaging
 .Python
 build/

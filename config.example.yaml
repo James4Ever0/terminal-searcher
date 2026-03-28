@@ -33,18 +33,21 @@ terminal:
   # Whether to use login shell (-l flag)
   login_shell: true
 
-# Session manager configuration
+# Session manager configuration (REQUIRED: tmux or screen)
 # Controls how terminal sessions are managed and captured
 session_manager:
-  # Mode: "local" | "screen" | "tmux"
-  #   - local: Direct PTY fork (default, no external dependencies)
+  # Mode: "tmux" | "screen"
+  #   - tmux: Use Tmux for session management (recommended)
   #   - screen: Use GNU Screen for session management
-  #   - tmux: Use Tmux for session management
-  mode: local
+  # Requires installing tmux or screen:
+  #   sudo apt-get install tmux  # Debian/Ubuntu
+  #   sudo yum install tmux      # RHEL/CentOS
+  #   brew install tmux          # macOS
+  mode: tmux
 
-  # Local mode settings (used when mode="local")
-  local:
-    use_pty: true
+  # Disable frontend terminal capture - use backend capture via tmux/screen instead
+  # When true, the web UI will not capture screenshots; server handles it
+  disable_client_capture: true
 
   # GNU Screen settings (used when mode="screen")
   screen:
@@ -52,6 +55,9 @@ session_manager:
     socket_dir: "~/.flashback-terminal/screen"
     # Screen binary name or path
     binary: "screen"
+    # Custom screen config file (null = use default)
+    # For kiosk mode (no Ctrl-a commands): escape ''
+    config_file: null
 
   # Tmux settings (used when mode="tmux")
   tmux:
@@ -69,7 +75,7 @@ session_manager:
       TMUX_SESSION: ""
 
   # Backend session capture settings
-  # When using screen/tmux, captures can be taken server-side
+  # When using screen/tmux, captures can be taken server-side via capture-pane/hardcopy
   capture:
     enabled: true
     interval_seconds: 10

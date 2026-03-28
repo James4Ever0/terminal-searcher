@@ -1,4 +1,8 @@
-"""PTY terminal management for flashback-terminal."""
+"""Terminal session management for flashback-terminal.
+
+Uses GNU Screen or Tmux for session management (no local PTY mode).
+This enables backend screenshot capture and text extraction.
+"""
 
 import uuid as uuid_mod
 from datetime import datetime

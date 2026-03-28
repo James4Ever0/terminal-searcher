@@ -7,3 +7,5 @@ capture terminal with text only: tmux capture-pane -p -t <session_name> > <outpu
 capture all visible area with escape sequence: tmux capture-pane -pe -t <session_name> -S - -E - > <output_file>
 
 capture all visible area with text only: tmux capture-pane -p -t <session_name> -S - -E - > <output_file>
+
+get terminal width and height: tmux display -t <session_name> -p '#{pane_width} #{pane_height}'

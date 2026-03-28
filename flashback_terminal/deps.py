@@ -29,6 +29,8 @@ To fix this issue, run:
 """
 
 
+
+
 class BinaryDependencyError(DependencyError):
     """Error raised when a required binary is missing."""
 

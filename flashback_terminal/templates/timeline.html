@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Timeline - Flashback Terminal</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #333;
+        }
+        h1 { font-size: 28px; color: #fff; }
+        h1 a { color: #fff; text-decoration: none; }
+        h1 a:hover { color: #4a9eff; }
+        .nav-links a {
+            color: #4a9eff;
+            text-decoration: none;
+            margin-left: 20px;
+            font-size: 14px;
+        }
+        .nav-links a:hover { text-decoration: underline; }
+        .timeline-controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .timeline-controls button {
+            padding: 10px 20px;
+            font-size: 14px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            color: #fff;
+            cursor: pointer;
+        }
+        .timeline-controls button:hover {
+            border-color: #4a9eff;
+        }
+        .timeline-controls button.primary {
+            background: #4a9eff;
+            border-color: #4a9eff;
+        }
+        .timeline-controls button.primary:hover {
+            background: #3a8eef;
+        }
+        .timeline-controls button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .timeline-controls label {
+            color: #888;
+            font-size: 14px;
+        }
+        .timeline-controls input[type="datetime-local"],
+        .timeline-controls input[type="number"] {
+            padding: 12px 16px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 16px;
+        }
+        .timeline-controls input[type="datetime-local"] {
+            width: 260px;
+            min-width: 260px;
+        }
+        .timeline-controls input[type="number"] {
+            width: 80px;
+        }
+        .timeline-controls select {
+            padding: 8px 12px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 6px;
+            color: #fff;
+            font-size: 14px;
+        }
+        .time-range-info {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px 20px;
+            margin-bottom: 20px;
+        }
+        .time-range-info .main {
+            color: #fff;
+            font-size: 16px;
+            margin-bottom: 5px;
+        }
+        .time-range-info .sub {
+            color: #888;
+            font-size: 13px;
+        }
+        .capture-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 15px;
+        }
+        .capture-card {
+            background: #1a1a1a;
+            border-radius: 12px;
+            overflow: hidden;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            border: 1px solid #333;
+        }
+        .capture-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+            border-color: #4a9eff;
+        }
+        .capture-card img {
+            width: 100%;
+            height: 160px;
+            object-fit: cover;
+            background: #0a0a0a;
+        }
+        .capture-card .no-image {
+            width: 100%;
+            height: 160px;
+            background: #0a0a0a;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #555;
+            font-size: 14px;
+        }
+        .capture-info {
+            padding: 12px;
+        }
+        .capture-time {
+            color: #888;
+            font-size: 12px;
+            font-family: monospace;
+        }
+        .capture-session {
+            color: #4a9eff;
+            font-size: 12px;
+            margin-top: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .capture-text {
+            color: #aaa;
+            font-size: 11px;
+            margin-top: 8px;
+            max-height: 40px;
+            overflow: hidden;
+            line-height: 1.4;
+        }
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #333;
+        }
+        .pagination button {
+            padding: 12px 24px;
+            font-size: 14px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            color: #fff;
+            cursor: pointer;
+        }
+        .pagination button:hover:not(:disabled) {
+            border-color: #4a9eff;
+        }
+        .pagination button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .no-results {
+            text-align: center;
+            padding: 60px;
+            color: #888;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #4a9eff;
+        }
+        .jump-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            border-left: 1px solid #333;
+            padding-left: 15px;
+            margin-left: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1><a href="/">Flashback Terminal</a></h1>
+            <div class="nav-links">
+                <a href="/">Terminal</a>
+                <a href="/timeline">Timeline</a>
+            </div>
+        </header>
+
+        <div class="timeline-controls">
+            <button class="primary" onclick="loadRecent()">Most Recent</button>
+            <button onclick="goBackPage()" id="backBtn">&larr; Back</button>
+            <button onclick="goForwardPage()" id="forwardBtn" disabled>Forward &rarr;</button>
+            <select id="pageSize" onchange="changePageSize()">
+                <option value="20">20 per page</option>
+                <option value="50" selected>50 per page</option>
+                <option value="100">100 per page</option>
+            </select>
+            <div class="jump-controls">
+                <label>Jump to:</label>
+                <input type="datetime-local" id="jumpTime">
+                <button onclick="jumpToTime()">Go</button>
+            </div>
+        </div>
+
+        <div class="time-range-info" id="timeRangeInfo" style="display: none;">
+            <div class="main" id="timeRangeMain"></div>
+            <div class="sub" id="timeRangeSub"></div>
+        </div>
+
+        <div class="capture-grid" id="captureGrid"></div>
+
+        <div class="pagination" id="pagination"></div>
+    </div>
+
+    <script>
+        const API_BASE = '/api/v1';
+
+        // State
+        let currentLimit = 50;
+        let currentResults = [];
+        let oldestTimestamp = null;
+        let viewMode = 'recent';
+        let currentBeforeTime = null;
+        let currentAroundTime = null;
+
+        // HTML escape function
+        function escapeHtml(text) {
+            if (text === null || text === undefined) return '';
+            const str = String(text);
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        // Format timestamp for display
+        function formatDateTime(timestamp) {
+            if (!timestamp) return '-';
+            const date = new Date(timestamp);
+            return date.toLocaleString();
+        }
+
+        // Parse datetime-local to timestamp
+        function parseDateTimeLocal(str) {
+            if (!str) return null;
+            return new Date(str).getTime() / 1000;
+        }
+
+        async function loadCaptures(params = {}) {
+            const grid = document.getElementById('captureGrid');
+            grid.innerHTML = '<div class="loading">Loading...</div>';
+
+            const queryParams = new URLSearchParams({
+                limit: currentLimit.toString()
+            });
+
+            if (params.before_time) {
+                queryParams.append('before_time', params.before_time);
+            }
+            if (params.around_time) {
+                queryParams.append('around_time', params.around_time);
+            }
+
+            try {
+                const res = await fetch(`${API_BASE}/captures/timeline?${queryParams}`);
+                const data = await res.json();
+
+                currentResults = data.results || [];
+                oldestTimestamp = data.oldest_timestamp;
+
+                renderCaptures(currentResults);
+                updatePaginationState();
+                renderTimeRangeInfo(data);
+            } catch (e) {
+                grid.innerHTML = `<div class="no-results">Error: ${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        function renderCaptures(results) {
+            const grid = document.getElementById('captureGrid');
+
+            if (!results || results.length === 0) {
+                grid.innerHTML = '<div class="no-results">No captures found</div>';
+                return;
+            }
+
+            grid.innerHTML = results.map(r => `
+                <div class="capture-card" onclick="window.location.href='/capture/${r.id}'">
+                    ${r.screenshot_url
+                        ? `<img src="${escapeHtml(r.screenshot_url)}" loading="lazy" alt="Terminal Capture">`
+                        : `<div class="no-image">No Screenshot</div>`
+                    }
+                    <div class="capture-info">
+                        <div class="capture-time">${escapeHtml(formatDateTime(r.timestamp))}</div>
+                        <div class="capture-session">${escapeHtml(r.session_name || 'Unknown Session')}</div>
+                        <div class="capture-text">${escapeHtml(r.ocr_text_preview || '')}</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderTimeRangeInfo(data) {
+            const infoBox = document.getElementById('timeRangeInfo');
+            const mainText = document.getElementById('timeRangeMain');
+            const subText = document.getElementById('timeRangeSub');
+
+            if (!currentResults || currentResults.length === 0) {
+                infoBox.style.display = 'none';
+                return;
+            }
+
+            infoBox.style.display = 'block';
+
+            const timeFrom = formatDateTime(data.time_from);
+            const timeTo = formatDateTime(data.time_to);
+            const count = currentResults.length;
+            const total = data.total;
+
+            mainText.textContent = `Showing ${count} captures from ${timeFrom} to ${timeTo}`;
+            subText.textContent = `Total captures in database: ${total}`;
+        }
+
+        function updatePaginationState() {
+            const backBtn = document.getElementById('backBtn');
+            const forwardBtn = document.getElementById('forwardBtn');
+
+            if (currentResults.length > 0 && oldestTimestamp) {
+                const oldestShown = Math.min(...currentResults.map(r => new Date(r.timestamp).getTime() / 1000));
+                backBtn.disabled = oldestShown <= oldestTimestamp;
+            } else {
+                backBtn.disabled = true;
+            }
+
+            forwardBtn.disabled = viewMode === 'recent';
+        }
+
+        function goBackPage() {
+            if (!currentResults || currentResults.length === 0) return;
+
+            const oldestShown = Math.min(...currentResults.map(r => new Date(r.timestamp).getTime() / 1000));
+
+            viewMode = 'before';
+            currentBeforeTime = oldestShown;
+            currentAroundTime = null;
+
+            loadCaptures({ before_time: oldestShown });
+        }
+
+        function goForwardPage() {
+            if (!currentResults || currentResults.length === 0) return;
+
+            if (viewMode === 'recent') {
+                return;
+            }
+
+            const newestShown = Math.max(...currentResults.map(r => new Date(r.timestamp).getTime() / 1000));
+            const now = Date.now() / 1000;
+
+            if (now - newestShown < 3600) {
+                loadRecent();
+                return;
+            }
+
+            const oldestShown = Math.min(...currentResults.map(r => new Date(r.timestamp).getTime() / 1000));
+            const span = newestShown - oldestShown;
+            const targetTime = newestShown + span;
+
+            loadCaptures({ around_time: targetTime });
+        }
+
+        function loadRecent() {
+            viewMode = 'recent';
+            currentBeforeTime = null;
+            currentAroundTime = null;
+            loadCaptures({});
+        }
+
+        function jumpToTime() {
+            const jumpTimeStr = document.getElementById('jumpTime').value;
+            if (!jumpTimeStr) {
+                alert('Please select a time to jump to');
+                return;
+            }
+
+            const jumpTimestamp = parseDateTimeLocal(jumpTimeStr);
+            if (!jumpTimestamp) {
+                alert('Invalid time format');
+                return;
+            }
+
+            viewMode = 'around';
+            currentAroundTime = jumpTimestamp;
+            currentBeforeTime = null;
+
+            loadCaptures({ around_time: jumpTimestamp });
+        }
+
+        function changePageSize() {
+            currentLimit = parseInt(document.getElementById('pageSize').value);
+            if (viewMode === 'recent') {
+                loadRecent();
+            } else if (viewMode === 'before' && currentBeforeTime) {
+                loadCaptures({ before_time: currentBeforeTime });
+            } else if (viewMode === 'around' && currentAroundTime) {
+                loadCaptures({ around_time: currentAroundTime });
+            } else {
+                loadRecent();
+            }
+        }
+
+        // Check for time query parameter on page load
+        function checkTimeQueryParam() {
+            const params = new URLSearchParams(window.location.search);
+            const timeParam = params.get('time');
+            if (timeParam) {
+                const timestamp = parseFloat(timeParam);
+                if (!isNaN(timestamp)) {
+                    const date = new Date(timestamp * 1000);
+                    const pad = n => n.toString().padStart(2, '0');
+                    const dateStr = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+                    document.getElementById('jumpTime').value = dateStr;
+                    viewMode = 'around';
+                    currentAroundTime = timestamp;
+                    currentBeforeTime = null;
+                    loadCaptures({ around_time: timestamp });
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Load recent on page load
+        if (!checkTimeQueryParam()) {
+            loadRecent();
+        }
+    </script>
+</body>
+</html>

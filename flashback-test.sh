@@ -1,5 +1,7 @@
 #!/bin/bash
 
+conda deactivate
+
 test -f .venv/bin/activate
 if [ $? -ne 0 ]; then
     echo "Virtual env not found at .venv"
@@ -9,4 +11,7 @@ fi
 
 source .venv/bin/activate
 uv pip install --reinstall .[dev,embedding]
+
+# remove default data storage
+rm -rf /home/jamesbrown/.local/share/flashback-terminal
 flashback-terminal $@

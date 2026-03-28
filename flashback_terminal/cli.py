@@ -1,6 +1,6 @@
 """CLI for flashback-terminal."""
 
-import signal
+import os
 import sys
 from pathlib import Path
 
@@ -58,6 +58,8 @@ def cli(ctx, verbose, config):
     # Command line verbosity overrides config
     if verbose > 0:
         Logger.set_verbosity(verbose)
+        cfg.set("logging.verbosity", verbose)
+        os.environ['CLI_VERBOSITY'] = str(verbose)
     else:
         Logger.set_verbosity(cfg.verbosity)
 
@@ -126,18 +128,18 @@ terminal:
   cols: 80
   shell: null
 
-# Session manager configuration
-# mode: "local" | "screen" | "tmux"
-#   - local: Direct PTY fork (default, no dependencies)
+# Session manager configuration (REQUIRED: tmux or screen)
+# mode: "tmux" | "screen"
+#   - tmux: Use Tmux for session management (recommended)
 #   - screen: Use GNU Screen for session management
-#   - tmux: Use Tmux for session management
+# Requires: sudo apt-get install tmux  (or screen)
 session_manager:
-  mode: local
-  local:
-    use_pty: true
+  mode: tmux
+  disable_client_capture: true  # Disable frontend capture, use backend only
   screen:
     socket_dir: "~/.flashback-terminal/screen"
     binary: "screen"
+    config_file: null
   tmux:
     socket_dir: "~/.flashback-terminal/tmux"
     binary: "tmux"

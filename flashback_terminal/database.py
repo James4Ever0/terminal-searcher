@@ -24,6 +24,10 @@ class Session:
     last_cwd: Optional[str]
     status: str
     metadata: Dict[str, Any]
+    session_type: str = "tmux"  # 'screen' or 'tmux'
+    socket_path: Optional[str] = None
+    pane_id: Optional[str] = None
+    window_id: Optional[str] = None
 
 
 @dataclass
@@ -45,6 +49,18 @@ class Screenshot:
     file_size: int
     width: int
     height: int
+
+
+@dataclass
+class TerminalCapture:
+    """Backend terminal capture for screen/tmux sessions."""
+    id: int
+    session_id: int
+    timestamp: datetime
+    screenshot_path: Optional[str]
+    text_content: Optional[str]
+    ansi_content: Optional[str]
+    capture_type: str  # 'screen', 'tmux', 'frontend'
 
 
 class Database:
@@ -77,7 +93,11 @@ class Database:
                     ended_at TIMESTAMP,
                     last_cwd TEXT,
                     status TEXT DEFAULT 'active',
-                    metadata TEXT
+                    metadata TEXT,
+                    session_type TEXT DEFAULT 'tmux',  -- 'screen' or 'tmux'
+                    socket_path TEXT,                   -- path to socket file
+                    pane_id TEXT,                       -- for tmux: pane identifier
+                    window_id TEXT                      -- for tmux: window identifier
                 )
             """)
 
@@ -130,6 +150,19 @@ class Database:
             """)
 
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS terminal_captures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    screenshot_path TEXT,              -- Path to PNG screenshot (backend rendered)
+                    text_content TEXT,                 -- Plain text content (OCR result)
+                    ansi_content TEXT,                 -- ANSI escape sequences
+                    capture_type TEXT DEFAULT 'tmux',  -- 'screen', 'tmux', or 'frontend'
+                    metadata TEXT                      -- JSON with additional capture info
+                )
+            """)
+
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS embeddings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -160,22 +193,35 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_output_session ON terminal_output(session_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_output_sequence ON terminal_output(session_id, sequence_num)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_screenshots_session ON screenshots(session_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_captures_session ON terminal_captures(session_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_captures_timestamp ON terminal_captures(timestamp)")
 
             conn.commit()
 
     @log_function(Logger.DEBUG)
     def create_session(
-        self, uuid: str, name: str, profile_name: str, metadata: Optional[Dict] = None
+        self,
+        uuid: str,
+        name: str,
+        profile_name: str,
+        metadata: Optional[Dict] = None,
+        session_type: str = "tmux",
+        socket_path: Optional[str] = None,
+        pane_id: Optional[str] = None,
+        window_id: Optional[str] = None,
     ) -> int:
-        logger.debug(f"Creating session: uuid={uuid}, name={name}, profile={profile_name}")
+        logger.debug(f"Creating session: uuid={uuid}, name={name}, profile={profile_name}, type={session_type}")
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO sessions (uuid, name, profile_name, metadata) VALUES (?, ?, ?, ?)",
-                (uuid, name, profile_name, json.dumps(metadata or {})),
+                """INSERT INTO sessions
+                    (uuid, name, profile_name, metadata, session_type, socket_path, pane_id, window_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (uuid, name, profile_name, json.dumps(metadata or {}),
+                 session_type, socket_path, pane_id, window_id),
             )
             conn.commit()
             session_id = cursor.lastrowid
-            logger.info(f"Session created: id={session_id}, uuid={uuid}")
+            logger.info(f"Session created: id={session_id}, uuid={uuid}, type={session_type}")
             return session_id
 
     def get_session(self, session_id: int) -> Optional[Session]:
@@ -193,7 +239,8 @@ class Database:
             return None
 
     def update_session(self, session_id: int, **kwargs) -> None:
-        allowed = {"name", "last_cwd", "status", "ended_at", "last_active_at", "metadata"}
+        allowed = {"name", "last_cwd", "status", "ended_at", "last_active_at", "metadata",
+                   "session_type", "socket_path", "pane_id", "window_id"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
@@ -336,6 +383,10 @@ class Database:
             last_cwd=row["last_cwd"],
             status=row["status"],
             metadata=json.loads(row["metadata"] or "{}"),
+            session_type=row["session_type"] or "tmux",
+            socket_path=row["socket_path"],
+            pane_id=row["pane_id"],
+            window_id=row["window_id"],
         )
 
     def _row_to_terminal_output(self, row) -> TerminalOutput:
@@ -357,4 +408,169 @@ class Database:
             file_size=row["file_size"],
             width=row["width"],
             height=row["height"],
+        )
+
+    def insert_terminal_capture(
+        self,
+        session_id: int,
+        screenshot_path: Optional[str] = None,
+        text_content: Optional[str] = None,
+        ansi_content: Optional[str] = None,
+        capture_type: str = "tmux",
+        metadata: Optional[Dict] = None,
+    ) -> int:
+        """Insert a terminal capture record (backend screenshot from screen/tmux)."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO terminal_captures
+                    (session_id, screenshot_path, text_content, ansi_content, capture_type, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, screenshot_path, text_content, ansi_content,
+                 capture_type, json.dumps(metadata or {})),
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_terminal_captures(
+        self, session_id: int, limit: int = 100, offset: int = 0
+    ) -> List[TerminalCapture]:
+        """Get terminal captures for a session."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM terminal_captures
+                   WHERE session_id = ?
+                   ORDER BY timestamp DESC
+                   LIMIT ? OFFSET ?""",
+                (session_id, limit, offset),
+            ).fetchall()
+            return [self._row_to_capture(row) for row in rows]
+
+    def get_terminal_captures_timeline(
+        self,
+        before_time: Optional[float] = None,
+        around_time: Optional[float] = None,
+        limit: int = 50,
+    ) -> List[Dict]:
+        """Get terminal captures for timeline view."""
+        with self._connect() as conn:
+            if around_time:
+                # Get captures around a specific time
+                rows = conn.execute(
+                    """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
+                       FROM terminal_captures tc
+                       JOIN sessions s ON tc.session_id = s.id
+                       WHERE abs(strftime('%s', tc.timestamp) - ?) < 300
+                       ORDER BY tc.timestamp DESC
+                       LIMIT ?""",
+                    (around_time, limit),
+                ).fetchall()
+            elif before_time:
+                # Get captures before a specific time
+                rows = conn.execute(
+                    """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
+                       FROM terminal_captures tc
+                       JOIN sessions s ON tc.session_id = s.id
+                       WHERE strftime('%s', tc.timestamp) < ?
+                       ORDER BY tc.timestamp DESC
+                       LIMIT ?""",
+                    (before_time, limit),
+                ).fetchall()
+            else:
+                # Get most recent captures
+                rows = conn.execute(
+                    """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
+                       FROM terminal_captures tc
+                       JOIN sessions s ON tc.session_id = s.id
+                       ORDER BY tc.timestamp DESC
+                       LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_terminal_capture_by_id(self, capture_id: int) -> Optional[Dict]:
+        """Get a single terminal capture with session info."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
+                   FROM terminal_captures tc
+                   JOIN sessions s ON tc.session_id = s.id
+                   WHERE tc.id = ?""",
+                (capture_id,),
+            ).fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def get_terminal_capture_neighbors(
+        self, capture_id: int, before: int = 5, after: int = 5
+    ) -> List[Dict]:
+        """Get neighboring captures for timeline context."""
+        with self._connect() as conn:
+            # First get the timestamp of the reference capture
+            ref = conn.execute(
+                "SELECT timestamp FROM terminal_captures WHERE id = ?",
+                (capture_id,),
+            ).fetchone()
+            if not ref:
+                return []
+
+            ref_time = ref["timestamp"]
+
+            # Get captures before
+            before_rows = conn.execute(
+                """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
+                   FROM terminal_captures tc
+                   JOIN sessions s ON tc.session_id = s.id
+                   WHERE tc.timestamp < ?
+                   ORDER BY tc.timestamp DESC
+                   LIMIT ?""",
+                (ref_time, before),
+            ).fetchall()
+
+            # Get captures after
+            after_rows = conn.execute(
+                """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
+                   FROM terminal_captures tc
+                   JOIN sessions s ON tc.session_id = s.id
+                   WHERE tc.timestamp > ?
+                   ORDER BY tc.timestamp ASC
+                   LIMIT ?""",
+                (ref_time, after),
+            ).fetchall()
+
+            # Combine and mark center
+            results = []
+            for row in reversed(before_rows):
+                d = dict(row)
+                d["is_center"] = False
+                results.append(d)
+
+            center = conn.execute(
+                """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
+                   FROM terminal_captures tc
+                   JOIN sessions s ON tc.session_id = s.id
+                   WHERE tc.id = ?""",
+                (capture_id,),
+            ).fetchone()
+            if center:
+                c = dict(center)
+                c["is_center"] = True
+                results.append(c)
+
+            for row in after_rows:
+                d = dict(row)
+                d["is_center"] = False
+                results.append(d)
+
+            return results
+
+    def _row_to_capture(self, row) -> TerminalCapture:
+        return TerminalCapture(
+            id=row["id"],
+            session_id=row["session_id"],
+            timestamp=datetime.fromisoformat(row["timestamp"]),
+            screenshot_path=row["screenshot_path"],
+            text_content=row["text_content"],
+            ansi_content=row["ansi_content"],
+            capture_type=row["capture_type"],
         )

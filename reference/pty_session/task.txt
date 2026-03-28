@@ -1,0 +1,1 @@
+you would create a tmux or gnu screen session in detach mode, then attach to it, use the attached process to communicate with websocket, instead of using capture pane command. you would also send terminal input to the attached process.

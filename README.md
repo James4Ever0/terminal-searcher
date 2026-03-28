@@ -157,11 +157,10 @@ terminal:
   shell: null  # Uses $SHELL by default
   login_shell: true
 
-# Session manager: local | screen | tmux
+# Session manager: tmux | screen (REQUIRED)
 session_manager:
-  mode: local
-  local:
-    use_pty: true
+  mode: tmux
+  disable_client_capture: true
   screen:
     socket_dir: "~/.flashback-terminal/screen"
     binary: "screen"
@@ -246,19 +245,17 @@ Base directory for all data storage (database, logs, screenshots, archives).
 - `login_shell`: Use login shell (-l flag)
 
 #### `session_manager`
-Controls how terminal sessions are created and managed.
+Controls how terminal sessions are created and managed. **REQUIRES tmux or screen to be installed.**
 
-- `mode`: Session management mode ("local", "screen", "tmux")
-  - **local**: Direct PTY fork (default, no external dependencies)
+- `mode`: Session management mode ("tmux" or "screen")
+  - **tmux**: Use Tmux for session management (recommended)
   - **screen**: Use GNU Screen for session management
-  - **tmux**: Use Tmux for session management
-
-**Local mode options:**
-- `local.use_pty`: Use pseudo-terminal (default: true)
+- `disable_client_capture`: Disable frontend terminal capture, use backend only (default: true)
 
 **Screen mode options:**
 - `screen.socket_dir`: Directory for screen sockets (default: "~/.flashback-terminal/screen")
 - `screen.binary`: Screen binary name or path (default: "screen")
+- `screen.config_file`: Path to custom screenrc (null = default). For kiosk mode use `escape ''`
 
 **Tmux mode options:**
 - `tmux.socket_dir`: Directory for tmux sockets (default: "~/.flashback-terminal/tmux")
@@ -266,7 +263,7 @@ Controls how terminal sessions are created and managed.
 - `tmux.config_file`: Path to custom tmux config (null = default)
 - `tmux.nested_session_env`: Environment variables to unset for nested session support
 
-**Backend capture options (for screen/tmux):**
+**Backend capture options:**
 - `capture.enabled`: Enable server-side session capture (default: true)
 - `capture.interval_seconds`: Capture interval (default: 10)
 - `capture.capture_full_scrollback`: Capture full scrollback history (default: true)
@@ -275,6 +272,7 @@ Example session_manager configuration:
 ```yaml
 session_manager:
   mode: tmux
+  disable_client_capture: true
   tmux:
     socket_dir: "~/.flashback-terminal/tmux"
     binary: "tmux"
@@ -447,16 +445,21 @@ profiles:
 
 ### Q: What session manager should I use?
 
-A: flashback-terminal supports three session management modes:
+A: flashback-terminal **requires** either tmux or screen to be installed:
 
-1. **local** (default): Direct PTY fork - works everywhere, no dependencies
-2. **tmux**: Uses tmux for session management - enables backend screenshot capture
-3. **screen**: Uses GNU Screen - enables backend screenshot capture
+1. **tmux** (recommended): Modern terminal multiplexer with better capture support
+2. **screen**: Traditional GNU Screen - also works well
 
-To use tmux or screen:
+Both enable:
+- **Backend screenshot capture**: Server captures terminal content without frontend
+- **Session persistence**: Sessions survive browser disconnections
+- **Server-side text extraction**: OCR from terminal content
+
+To use tmux:
 ```bash
 # Install tmux
-sudo apt-get install tmux
+sudo apt-get install tmux  # Debian/Ubuntu
+brew install tmux          # macOS
 
 # Configure flashback-terminal
 flashback-terminal init

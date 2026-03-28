@@ -1,0 +1,2 @@
+incorrect layout under tmux backend mode. also no color is in the tmux. shall we enable TERM=xterm-256color?
+switch worker from poll oriented to event driven, can we listen to sqlite insert events, for those ocr workers or window title workers?

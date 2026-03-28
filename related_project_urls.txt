@@ -1,2 +1,3 @@
 # local terminal emulator, robust, but without history capture or replay to web.
 https://github.com/James4Ever0/termexec
+https://github.com/zhangyang-crazy-one/tabby-ai-assistant

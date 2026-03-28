@@ -38,18 +38,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "login_shell": True,
     },
     "session_manager": {
-        "mode": "local",  # "local", "screen", "tmux"
-        "local": {
-            "use_pty": True,
-        },
+        "mode": "tmux",  # "screen", "tmux" (REQUIRED: local PTY mode removed)
+        "disable_client_capture": True,  # Disable frontend terminal capture
         "screen": {
             "socket_dir": "~/.flashback-terminal/screen",
             "binary": "screen",
+            "config_file": None,  # Path to custom screenrc (escape '' for kiosk mode)
         },
         "tmux": {
             "socket_dir": "~/.flashback-terminal/tmux",
             "binary": "tmux",
-            "config_file": None,  # Path to custom tmux config
+            "config_file": None,  # Path to custom tmux.conf
             "nested_session_env": {
                 "TMUX": "",
                 "TMUX_PANE": "",
@@ -213,6 +212,15 @@ class Config:
             if value is None:
                 return default
         return value
+    
+    def set(self, key:str, value: Any) -> None:
+        keys = key.split(".")
+        config = self._config
+        for k in keys[:-1]:
+            if k not in config:
+                config[k] = {}
+            config = config[k]
+        config[keys[-1]] = value
 
     def is_module_enabled(self, module_name: str) -> bool:
         return self.get(f"modules.{module_name}.enabled", True)
@@ -252,7 +260,7 @@ class Config:
 
     @property
     def session_manager_mode(self) -> str:
-        return self.get("session_manager.mode", "local")
+        return self.get("session_manager.mode", "tmux")
 
     def get_session_manager_config(self) -> Dict[str, Any]:
         mode = self.session_manager_mode
