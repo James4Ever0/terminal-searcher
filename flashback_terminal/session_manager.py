@@ -17,6 +17,9 @@ import tempfile
 import termios
 import time
 import uuid
+import parse
+import traceback
+import json
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -104,11 +107,15 @@ class BaseSession(ABC):
         name: str,
         profile: Dict[str, Any],
         on_output: Optional[Callable[[str], None]] = None,
+        on_clear: Optional[Callable[[], None]] = None,
+        on_cursor: Optional[Callable[[int, int], None]] = None,
     ):
         self.session_id = session_id
         self.name = name
         self.profile = profile
         self.on_output = on_output
+        self.on_clear = on_clear
+        self.on_cursor = on_cursor
         self._sequence_num = 0
         self._cwd: Optional[str] = None
         self._created_at = time.time()
@@ -173,8 +180,10 @@ class TmuxSession(BaseSession):
         profile: Dict[str, Any],
         socket_dir: str,
         on_output: Optional[Callable[[str], None]] = None,
+        on_clear: Optional[Callable[[], None]] = None,
+        on_cursor: Optional[Callable[[int, int], None]] = None,
     ):
-        super().__init__(session_id, name, profile, on_output)
+        super().__init__(session_id, name, profile, on_output, on_clear, on_cursor)
         self._socket_dir = Path(socket_dir).expanduser()
         self._socket_name = f"flashback-{self.session_id}"
         self._socket_path = self._socket_dir / self._socket_name
@@ -184,6 +193,15 @@ class TmuxSession(BaseSession):
         self._running = False
         self._pty_fd: Optional[int] = None
         self.pid: Optional[int] = None
+        self._last_output: Optional[str] = None
+        self._kiosk_config = """
+unbind-key 'C-b'
+
+set -g status off
+set -g mouse off
+
+set -g default-terminal "screen-256color"
+"""
 
     def _get_env(self) -> Dict[str, str]:
         """Get environment for tmux commands (unsets TMUX for nested sessions)."""
@@ -196,6 +214,7 @@ class TmuxSession(BaseSession):
         for var in tmux_vars:
             env.pop(var, None)
         # Set custom socket
+        env['TERM'] = 'xterm-256color'
         env["TMUX_TMPDIR"] = str(self._socket_dir)
         return env
 
@@ -238,9 +257,15 @@ class TmuxSession(BaseSession):
         cmd = [
             self._tmux_binary,
             "-S", str(self._socket_path),
+            "-T", "mouse,256,focus,title"
         ]
         if self._config_file:
             cmd.extend(["-f", self._config_file])
+        else:
+            # Add kiosk config
+            self._config_file = self._socket_dir / f"{self._socket_name}.conf"
+            self._config_file.write_text(self._kiosk_config)
+            cmd.extend(["-f", str(self._config_file)])
         cmd.extend(args)
 
         env = self._get_env()
@@ -284,15 +309,16 @@ class TmuxSession(BaseSession):
                 "-d",
                 "-s", self._socket_name,
                 "-n", "main",
+                "-e", "TERM=xterm-256color",
                 start_command,
             ])
 
             self._run_tmux(["set-option", '-g', "default-terminal", "xterm-256color"])
 
             # set -g status off
-            # set -g mouse on
+            # set -g mouse off
             self._run_tmux(["set-option", "-g", "status", "off"])
-            self._run_tmux(["set-option", "-g", "mouse", "on"])
+            self._run_tmux(["set-option", "-g", "mouse", "off"])
 
             # set-environment -r TMUX
             self._run_tmux(["set-environment", "-r", "TMUX"])
@@ -394,7 +420,7 @@ class TmuxSession(BaseSession):
             logger.debug(f"[TmuxSession] Session not running, cannot read")
             return None
 
-        # Try pty first if available
+        # # Try pty first if available
         if self._pty_fd is None:
             logger.debug(f"[TmuxSession] No pty available for tmux session {self._socket_name}, cannot read.")
         else:
@@ -408,6 +434,7 @@ class TmuxSession(BaseSession):
                     logger.debug(f"[TmuxSession] Read {len(data)} bytes from pty")
                     text = data.decode("utf-8", errors="replace")
                     self._log_output(text)
+                    self._read_mode = "pty"
                     return text
                 else:
                     # EOF - pty closed
@@ -427,12 +454,82 @@ class TmuxSession(BaseSession):
 
             if result.returncode == 0 and result.stdout:
                 text = result.stdout
+                if text == self._last_output:
+                    return None
+                self._last_output = text
+                self.on_clear()
+                # TODO: rstrip text before sending to frontend does not help very well.
                 self._log_output(text)
+                col, row = self._get_cursor()
+                self.on_cursor(col, row)
+                self._read_mode = "capture_pane"
                 return text
         except Exception as e:
+            traceback.print_exc()
             logger.debug(f"[TmuxSession] Read error: {e}")
 
         return None
+    
+    def _get_cursor(self) -> (int, int):
+        has_cursor, (col, row) = self._get_cursor_coordinates()
+        if has_cursor:
+            return col, row
+        return 0, 0
+
+    def _get_info(self):
+        list_session_format_template = "[#{session_name}] socket: #{socket_path} size: #{window_width}x#{window_height} cursor at: x=#{cursor_x},y=#{cursor_y} cursor flag: #{cursor_flag} cursor character: #{cursor_character} insert flag: #{insert_flag}, keypad cursor flag: #{keypad_cursor_flag}, keypad flag: #{keypad_flag}"
+        # session_filter = "#{==:#{session_name}," + self.name + "}"
+        output_bytes = subprocess.check_output(
+            ["tmux", "-S", str(self._socket_path), "list-sessions", "-F", list_session_format_template, 
+            # "-f", session_filter
+            ]
+        )
+        logger.debug("[*] Output bytes:\n" + output_bytes.decode("utf-8"))
+        numeric_properties = [
+            "window_width",
+            "window_height",
+            "cursor_x",
+            "cursor_y",
+            "cursor_flag",
+            "insert_flag",
+            "keypad_cursor_flag",
+            "keypad_flag",
+        ]
+        # nonword_properties = ['cursor_character', 'socket_path']
+        parse_format = list_session_format_template.replace(
+            "#{", "{"
+        )  # .replace("}",":w}")
+        # for it in nonword_properties:
+        #     parse_format = parse_format.replace("{"+it+":w}","{"+it+"}")
+        output = output_bytes.decode('utf-8', errors="strict")
+        output = output[:-1]  # strip trailing newline
+        # print("[*] Parse format:")
+        # print(parse_format)
+        data = parse.parse(parse_format, output)
+        if isinstance(data, parse.Result):
+            ret = data.named
+            for it in numeric_properties:
+                ret[it] = int(ret[it])  # type: ignore
+            pprint_result = json.dumps(ret, indent=4, ensure_ascii=False)
+            logger.debug("[+] Fetched info for session:"+ str(self._socket_path)+"\n"+pprint_result)
+            return ret
+        else:
+            print("[-] No info for session:", self.name)
+
+
+    def _get_cursor_coordinates(self):
+        print("[*] Requesting cursor coordinates")
+        has_cursor = False
+        coordinates = (-1, -1)
+        info = self._get_info()
+        if info is None:
+            print("[-] Failed to fetch corsor coordinates")
+        else:
+            x, y = info["cursor_x"], info["cursor_y"]
+            print("[*] Cursor at: %d, %d" % (x, y))
+            coordinates = (x, y)
+            has_cursor = True
+        return has_cursor, coordinates
 
     def resize(self, rows: int, cols: int) -> None:
         """Resize tmux window."""
@@ -503,6 +600,22 @@ class ScreenSession(BaseSession):
         on_output: Optional[Callable[[str], None]] = None,
     ):
         super().__init__(session_id, name, profile, on_output)
+        self._kiosk_config = """
+# Disable all command keys
+escape ''
+unbindall
+
+# Remove status/info displays
+hardstatus off
+startup_message off
+vbell off
+
+# Remove STY variable from new windows
+unsetenv STY
+
+# Optional: Set a restricted shell as default
+# shell /bin/rbash
+"""
         self._socket_dir = Path(socket_dir).expanduser()
         self._session_name = f"flashback-{self.session_id}"
         self._socket_path = self._socket_dir / self._session_name
@@ -510,6 +623,8 @@ class ScreenSession(BaseSession):
         self._running = False
         self._config_file: Optional[str] = None
         self._pty_fd: Optional[int] = None
+        self._read_mode: Optional[str] = None
+        self.pid: Optional[int] = None
 
     def _run_screen(self, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
         """Run screen command with custom socket."""
@@ -524,6 +639,8 @@ class ScreenSession(BaseSession):
         env["SCREENDIR"] = str(self._socket_dir)
         env.pop("STY", None)  # Unset STY for nested session support
 
+        logger.trace("[ScreenSession] Running screen command with SCREENDIR=%s: %s" % (self._socket_dir, " ".join(cmd)))
+
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -534,9 +651,30 @@ class ScreenSession(BaseSession):
 
         if check and result.returncode != 0:
             raise SessionManagerError(
-                f"screen command failed: {' '.join(args)}\n{result.stderr}"
+                f"screen command failed: {' '.join(args)}\nRaw cmd: {' '.join(cmd)}\nStdout:{result.stdout}\nStderr:{result.stderr}"
             )
         return result
+
+
+
+    def _get_attach_tty(self):
+        try:
+            self.pid, self._pty_fd = pty.fork()
+            args = ['-S', str(self._session_name), '-A', '-r', '-O', '-a']
+            logger.debug(f"[ScreenSession] Child process execvpe: screen {' '.join(args)}")
+            if self.pid == 0:
+                # self._running = False
+                # self._pty_fd = None
+                # ATTENTION: must pass os.environ. is there anything special about the environ? can we pass empty dict to it?
+                # cannot pass empty dict, otherwise we will fail to obtain output or spawn process
+                os.execvpe(shutil.which("screen"), [shutil.which("screen")] + args, dict(SHELL='/bin/bash', TERM='xterm-256color', LANG='en_US.UTF-8', SCREENDIR=self._socket_dir))
+            else:
+                logger.debug(f"[ScreenSession] Attached to screen session at {self._socket_path}")
+                self._running = True
+                return True
+        except Exception as e:
+            logger.debug(f"[TmuxSession] Failed to attach: {e}")
+            return False
 
     def _get_screen_pty(self) -> Optional[str]:
         """Get the pty device path for the screen session."""
@@ -548,24 +686,26 @@ class ScreenSession(BaseSession):
             # Parse output to find our session
             # Example: "\t1234.flashback-session_id\t(Detached)"
             lines = result.stdout.splitlines()
+            logger.debug("[ScreenSession] Screen list output:\n" + result.stdout)
             for line in lines:
                 if self._session_name in line:
                     # Extract pid (first token before dot)
                     parts = line.strip().split()
-                    if parts:
+                    if not parts:
+                        logger.debug("[ScreenSession] Cannot found part with session name: " + self._session_name)
+                    else:
                         pid_dot = parts[0]
+                        logger.debug("[ScreenSession] Found socket name: " +pid_dot)
                         if '.' in pid_dot:
                             pid = pid_dot.split('.')[0]
                             # Find pty in /proc/<pid>/fd
                             proc_fd_dir = Path(f"/proc/{pid}/fd")
+                            socket_path = self._socket_dir / pid_dot
                             if proc_fd_dir.exists():
-                                for fd in proc_fd_dir.iterdir():
-                                    try:
-                                        fd_link = fd.resolve()
-                                        if fd_link.is_char_device() and 'pts' in str(fd_link):
-                                            return str(fd_link)
-                                    except Exception:
-                                        continue
+                                logger.debug("[ScreenSession] Socket is running: %s" % socket_path)
+                                return socket_path
+                            else:
+                                logger.debug("[ScreenSession] PID %s not running for socket %s" % (pid, socket_path))
         except Exception as e:
             logger.debug(f"Failed to get screen pty: {e}")
         return None
@@ -576,6 +716,8 @@ class ScreenSession(BaseSession):
         logger.info(f"Starting screen session: {self.session_id}")
 
         self._socket_dir.mkdir(parents=True, exist_ok=True)
+        # change mode to 700
+        self._socket_dir.chmod(0o700)
 
         shell = self.profile.get("shell") or os.environ.get("SHELL", "/bin/bash")
         args = self.profile.get("args", [])
@@ -596,6 +738,10 @@ class ScreenSession(BaseSession):
         try:
             # Build screen command
             screen_cmd = [
+                "-T", "xterm-256color", # more colors
+                "-a",
+                "-O", # optimized
+                "-U", # Unicode
                 "-d", "-m",  # Detached mode
                 "-s", shell,
             ]
@@ -603,6 +749,11 @@ class ScreenSession(BaseSession):
             # Add custom config if provided
             if self._config_file:
                 screen_cmd.extend(["-c", self._config_file])
+            else:
+                # Add kiosk config
+                self._config_file = self._socket_dir / f"{self._session_name}_config.rc"
+                self._config_file.write_text(self._kiosk_config)
+                screen_cmd.extend(["-c", str(self._config_file)])
 
             screen_cmd.extend(["bash", "-c", start_command])
 
@@ -611,20 +762,21 @@ class ScreenSession(BaseSession):
             self._running = True
 
             # Try to open the session's pty device for direct I/O
-            pty_path = None
+            raw_pty_path = None
             for _ in range(5):
-                pty_path = self._get_screen_pty()
-                if pty_path and os.path.exists(pty_path):
+                raw_pty_path = self._get_screen_pty()
+                if raw_pty_path and os.path.exists(raw_pty_path):
                     break
                 time.sleep(0.1)
+            logger.debug("[ScreenSession] Session Path: %s | Raw PTY path: %s" % (self._session_name, raw_pty_path))
 
-            if pty_path and os.path.exists(pty_path):
+
+            if raw_pty_path and os.path.exists(raw_pty_path):
                 try:
-                    # Open pty in non-blocking mode
-                    self._pty_fd = os.open(pty_path, os.O_RDWR | os.O_NONBLOCK)
-                    logger.debug(f"Opened pty {pty_path} for screen session {self._session_name}")
+                    self._get_attach_tty()
+                    logger.debug(f"Attached to pty {raw_pty_path} for screen session {self._session_name}")
                 except Exception as e:
-                    logger.warning(f"Failed to open pty {pty_path}: {e}")
+                    logger.warning(f"Failed to attach to pty {raw_pty_path}: {e}")
                     self._pty_fd = None
             else:
                 logger.warning(f"Could not find pty device for screen session {self._session_name}, using stuff/hardcopy fallback")
@@ -704,6 +856,8 @@ class ScreenSession(BaseSession):
 
     def resize(self, rows: int, cols: int) -> None:
         """Resize screen window."""
+        # TODO: row wise resize is not good for gnu screen. also the row position is not good when we attach to it from the web interface.
+        
         # Try to resize pty directly
         if self._pty_fd is not None:
             try:
@@ -713,13 +867,6 @@ class ScreenSession(BaseSession):
             except Exception as e:
                 logger.debug(f"Pty resize failed, falling back to stty: {e}")
 
-        try:
-            # Try to set terminal size via stty
-            self._run_screen([
-                "-X", "stuff", f"stty rows {rows} cols {cols}\n",
-            ], check=False)
-        except Exception as e:
-            logger.debug(f"Resize error: {e}")
 
     def is_running(self) -> bool:
         """Check if screen session is running."""
@@ -822,6 +969,8 @@ class SessionManager:
         name: str,
         profile: Dict[str, Any],
         on_output: Optional[Callable[[str], None]] = None,
+        on_clear: Optional[Callable[[], None]] = None,
+        on_cursor: Optional[Callable[[int, int], None]] = None,
     ) -> Optional[BaseSession]:
         """Create a new session based on configured mode."""
         mode = self.config.session_manager_mode
@@ -830,7 +979,7 @@ class SessionManager:
         if mode == "tmux":
             socket_dir = self.config.get("session_manager.tmux.socket_dir", "~/.flashback-terminal/tmux")
             config_file = self.config.get("session_manager.tmux.config_file")
-            session = TmuxSession(session_id, name, profile, socket_dir, on_output)
+            session = TmuxSession(session_id, name, profile, socket_dir, on_output, on_clear, on_cursor)
             session._config_file = config_file
         elif mode == "screen":
             socket_dir = self.config.get("session_manager.screen.socket_dir", "~/.flashback-terminal/screen")
@@ -841,7 +990,7 @@ class SessionManager:
             # Default to tmux if invalid mode
             logger.warning(f"Invalid session manager mode '{mode}', defaulting to tmux")
             socket_dir = self.config.get("session_manager.tmux.socket_dir", "~/.flashback-terminal/tmux")
-            session = TmuxSession(session_id, name, profile, socket_dir, on_output)
+            session = TmuxSession(session_id, name, profile, socket_dir, on_output, on_clear)
 
         if session.start():
             self._sessions[session_id] = session

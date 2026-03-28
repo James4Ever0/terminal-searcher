@@ -141,11 +141,18 @@ class TerminalTab {
         switch (msg.type) {
             case 'output':
                 this.terminal.write(msg.data);
+                console.dir(this.terminal);
                 break;
             case 'history_replay':
                 for (const chunk of msg.chunks) {
                     this.terminal.write(chunk.content);
                 }
+                break;
+            case "cursor":
+                this.terminal.write("\x1b["+(msg.row)+";"+(msg.col+1)+"H");
+                break;
+            case 'clear':
+                this.terminal.clear();
                 break;
             case 'cwd_change':
                 if (!msg.success) {

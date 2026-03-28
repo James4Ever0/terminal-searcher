@@ -51,7 +51,15 @@ class TerminalWebSocketHandler:
         def on_output(data: str) -> None:
             asyncio.create_task(self._send_output(session_uuid, data))
 
+        def on_clear() -> None:
+            asyncio.create_task(self._send_clear(session_uuid))
+        
+        def on_cursor(col:int, row:int) -> None:
+            asyncio.create_task(self._send_cursor(session_uuid, col, row))
+
         session.on_output = on_output
+        session.on_clear = on_clear
+        session.on_cursor = on_cursor
 
         await websocket.send_json(
             {
@@ -85,6 +93,19 @@ class TerminalWebSocketHandler:
             if session_uuid in self.active_connections:
                 del self.active_connections[session_uuid]
             session.on_output = None
+            session.on_clear = None
+            session.on_cursor = None
+    
+    async def _send_cursor(self, session_uuid:str, col:int, row:int) -> None:
+        if session_uuid in self.active_connections:
+            websocket = self.active_connections[session_uuid]
+            await websocket.send_json({"type": "cursor", "col": col, "row": row})
+
+    async def _send_clear(self, session_uuid: str) -> None:
+        """Send clear command to the WebSocket client."""
+        if session_uuid in self.active_connections:
+            websocket = self.active_connections[session_uuid]
+            await websocket.send_json({"type": "clear"})
 
     async def _send_output(self, session_uuid: str, data: str) -> None:
         """Send output to the WebSocket client."""

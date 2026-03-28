@@ -29,17 +29,30 @@ class TerminalSession:
         db: Database,
         profile: Dict[str, Any],
         on_output: Optional[Callable[[str], None]] = None,
+        on_clear: Optional[Callable[[], None]] = None,
+        on_cursor: Optional[Callable[[int, int], None]] = None,
     ):
         self.session_id = session_id
         self.uuid = uuid
         self.db = db
         self.on_output = on_output
+        self.on_clear = on_clear
+        self.on_cursor = on_cursor
         self.profile = profile
 
         self._session: Optional[BaseSession] = None
         self.sequence_num = 0
         self._cwd: Optional[str] = None
         self._running = False
+
+    def _on_session_clear(self) -> None:
+        """Handle clear event from underlying session."""
+        if self.on_clear:
+            self.on_clear()
+    
+    def _on_session_cursor(self, col:int, row:int) -> None:
+        if self.on_cursor:
+            self.on_cursor(col, row)
 
     def _on_session_output(self, content: str) -> None:
         """Handle output from underlying session."""
@@ -67,6 +80,8 @@ class TerminalSession:
             name=f"Terminal-{self.session_id}",
             profile=self.profile,
             on_output=self._on_session_output,
+            on_clear=self._on_session_clear,
+            on_cursor = self._on_session_cursor,
         )
 
         if self._session:
