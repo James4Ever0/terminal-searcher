@@ -109,6 +109,7 @@ class BaseSession(ABC):
         on_output: Optional[Callable[[str], None]] = None,
         on_clear: Optional[Callable[[], None]] = None,
         on_cursor: Optional[Callable[[int, int], None]] = None,
+        init_commands:list[str] = []
     ):
         self.session_id = session_id
         self.name = name
@@ -116,6 +117,7 @@ class BaseSession(ABC):
         self.on_output = on_output
         self.on_clear = on_clear
         self.on_cursor = on_cursor
+        self.init_commands=init_commands
         self._sequence_num = 0
         self._cwd: Optional[str] = None
         self._created_at = time.time()
@@ -182,8 +184,9 @@ class TmuxSession(BaseSession):
         on_output: Optional[Callable[[str], None]] = None,
         on_clear: Optional[Callable[[], None]] = None,
         on_cursor: Optional[Callable[[int, int], None]] = None,
+        init_commands:list[str] = [],
     ):
-        super().__init__(session_id, name, profile, on_output, on_clear, on_cursor)
+        super().__init__(session_id, name, profile, on_output, on_clear, on_cursor, init_commands=init_commands)
         self._socket_dir = Path(socket_dir).expanduser()
         self._socket_name = f"flashback-{self.session_id}"
         self._socket_path = self._socket_dir / self._socket_name
@@ -358,11 +361,25 @@ set -g default-terminal "screen-256color"
             else:
                 logger.warning(f"Could not find pty device for tmux session {self._socket_name}, using capture-pane fallback")
 
-            logger.info(f"Tmux session started: {self._socket_name}")
+            logger.info(f"[TmuxSession] Tmux session started: {self._socket_name}")
+            # execute init commands
+            logger.info(f"[TmuxSession] Executing init commands: {self.init_commands}")
+            for cmd in self.init_commands:
+                escaped = cmd.replace('"', '\\"')
+                self._run_tmux([
+                    "send-keys",
+                    "-t", self._target,
+                    escaped,
+                ], check=False)
+                self._run_tmux([
+                    "send-keys",
+                    "-t", self._target,
+                    "Enter",
+                ], check=False)
             return True
 
         except Exception as e:
-            logger.error(f"Failed to start tmux session: {e}")
+            logger.error(f"[TmuxSession] Failed to start tmux session: {e}")
             return False
 
     def stop(self) -> None:
@@ -381,7 +398,7 @@ set -g default-terminal "screen-256color"
                 "-t", self._socket_name,
             ], check=False)
         except Exception as e:
-            logger.debug(f"Error stopping tmux session: {e}")
+            logger.debug(f"[TmuxSession] Error stopping tmux session: {e}")
         self._running = False
 
     def write(self, data: str) -> None:
@@ -598,8 +615,9 @@ class ScreenSession(BaseSession):
         profile: Dict[str, Any],
         socket_dir: str,
         on_output: Optional[Callable[[str], None]] = None,
+        init_commands: list[str] = [],
     ):
-        super().__init__(session_id, name, profile, on_output)
+        super().__init__(session_id, name, profile, on_output, init_commands=init_commands)
         self._kiosk_config = """
 # Disable all command keys
 escape ''
@@ -781,11 +799,21 @@ unsetenv STY
             else:
                 logger.warning(f"Could not find pty device for screen session {self._session_name}, using stuff/hardcopy fallback")
 
-            logger.info(f"Screen session started: {self._session_name}")
+            logger.info(f"[ScreenSession] Screen session started: {self._session_name}")
+
+            logger.info(f"[ScreenSession] Executing init commands: {self.init_commands}")
+            for cmd in self.init_commands:
+                escaped = cmd.replace("'", "'\"'\"'")
+                self._run_screen([
+                    "-X", "stuff", escaped,
+                ], check=False)
+                self._run_screen([
+                    "-X", "stuff", "\n",
+                ], check=False)
             return True
 
         except Exception as e:
-            logger.error(f"Failed to start screen session: {e}")
+            logger.error(f"[ScreenSession] Failed to start screen session: {e}")
             return False
 
     def stop(self) -> None:
@@ -803,7 +831,7 @@ unsetenv STY
                 "-X", "quit",
             ], check=False)
         except Exception as e:
-            logger.debug(f"Error stopping screen session: {e}")
+            logger.debug(f"[ScreenSession] Error stopping screen session: {e}")
         self._running = False
 
     def write(self, data: str) -> None:
@@ -818,7 +846,7 @@ unsetenv STY
                 os.write(self._pty_fd, data.encode())
                 return
             except (OSError, BlockingIOError) as e:
-                logger.debug(f"Pty write failed, falling back to stuff: {e}")
+                logger.debug(f"[ScreenSession] Pty write failed, falling back to stuff: {e}")
                 # Fall back to stuff
 
         try:
@@ -828,7 +856,7 @@ unsetenv STY
                 "-X", "stuff", escaped,
             ], check=False)
         except Exception as e:
-            logger.debug(f"Write error: {e}")
+            logger.debug(f"[ScreenSession] Write error: {e}")
 
     def read(self, timeout: float = 0.1) -> Optional[str]:
         """Read from screen session (via pty or not supported)."""
@@ -847,7 +875,7 @@ unsetenv STY
                         return text
                 return None
             except (OSError, BlockingIOError) as e:
-                logger.debug(f"Pty read failed: {e}")
+                logger.debug(f"[ScreenSession] Pty read failed: {e}")
                 return None
 
         # Screen doesn't have a direct read mechanism like PTY
@@ -865,7 +893,7 @@ unsetenv STY
                 fcntl.ioctl(self._pty_fd, termios.TIOCSWINSZ, size)
                 return
             except Exception as e:
-                logger.debug(f"Pty resize failed, falling back to stty: {e}")
+                logger.debug(f"[ScreenSession] Pty resize failed, falling back to stty: {e}")
 
 
     def is_running(self) -> bool:
@@ -909,7 +937,7 @@ unsetenv STY
                 session_name=self._session_name,
             )
         except Exception as e:
-            logger.error(f"Capture error: {e}")
+            logger.error(f"[ScreenSession] Capture error: {e}")
             return None
 
 
@@ -979,18 +1007,21 @@ class SessionManager:
         if mode == "tmux":
             socket_dir = self.config.get("session_manager.tmux.socket_dir", "~/.flashback-terminal/tmux")
             config_file = self.config.get("session_manager.tmux.config_file")
-            session = TmuxSession(session_id, name, profile, socket_dir, on_output, on_clear, on_cursor)
+            init_commands = self.config.get("session_manager.tmux.init_commands", [])
+            session = TmuxSession(session_id=session_id, name=name, profile=profile, socket_dir=socket_dir, on_output=on_output, on_clear=on_clear, on_cursor=on_cursor, init_commands=init_commands)
             session._config_file = config_file
         elif mode == "screen":
             socket_dir = self.config.get("session_manager.screen.socket_dir", "~/.flashback-terminal/screen")
             config_file = self.config.get("session_manager.screen.config_file")
-            session = ScreenSession(session_id, name, profile, socket_dir, on_output)
+            init_commands = self.config.get("session_manager.screen.init_commands", [])
+            session = ScreenSession(session_id=session_id, name=name, profile=profile, socket_dir=socket_dir, on_output=on_output, init_commands=init_commands)
             session._config_file = config_file
         else:
             # Default to tmux if invalid mode
             logger.warning(f"Invalid session manager mode '{mode}', defaulting to tmux")
             socket_dir = self.config.get("session_manager.tmux.socket_dir", "~/.flashback-terminal/tmux")
-            session = TmuxSession(session_id, name, profile, socket_dir, on_output, on_clear)
+            init_commands = self.config.get("session_manager.tmux.init_commands", [])
+            session = TmuxSession(session_id=session_id, name=name, profile=profile, socket_dir=socket_dir, on_output=on_output, on_clear=on_clear, on_cursor=on_cursor, init_commands=init_commands)
 
         if session.start():
             self._sessions[session_id] = session

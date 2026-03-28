@@ -44,6 +44,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "socket_dir": "~/.flashback-terminal/screen",
             "binary": "screen",
             "config_file": None,  # Path to custom screenrc (escape '' for kiosk mode)
+            "init_commands": [
+                "unset STY",
+                "clear",
+            ],
         },
         "tmux": {
             "socket_dir": "~/.flashback-terminal/tmux",
@@ -55,6 +59,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "TMUX_WINDOW": "",
                 "TMUX_SESSION": "",
             },
+            "init_commands": [
+                "unset TMUX",
+                "unset TMUX_PANE",
+                "unset TMUX_WINDOW",
+                "unset TMUX_SESSION",
+                "clear",
+            ],
         },
         "capture": {
             "enabled": True,

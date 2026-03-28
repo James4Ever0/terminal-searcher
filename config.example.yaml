@@ -58,6 +58,9 @@ session_manager:
     # Custom screen config file (null = use default)
     # For kiosk mode (no Ctrl-a commands): escape ''
     config_file: null
+    init_commands:
+      - "unset STY"
+      - "clear"
 
   # Tmux settings (used when mode="tmux")
   tmux:
@@ -73,6 +76,12 @@ session_manager:
       TMUX_PANE: ""
       TMUX_WINDOW: ""
       TMUX_SESSION: ""
+    init_commands:
+      - "unset TMUX"
+      - "unset TMUX_PANE"
+      - "unset TMUX_WINDOW"
+      - "unset TMUX_SESSION"
+      - "clear"
 
   # Backend session capture settings
   # When using screen/tmux, captures can be taken server-side via capture-pane/hardcopy
