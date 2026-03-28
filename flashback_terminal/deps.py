@@ -16,6 +16,7 @@ class DependencyError(Exception):
         super().__init__(message)
 
     def __str__(self) -> str:
+        install_cmd_indented='\n'.join(['    '+it for it in self.install_cmd.splitlines()])
         return f"""
 {'='*70}
 DEPENDENCY ERROR: {self.message}
@@ -23,7 +24,7 @@ DEPENDENCY ERROR: {self.message}
 
 To fix this issue, run:
 
-    {self.install_cmd}
+{install_cmd_indented}
 
 {'='*70}
 """
