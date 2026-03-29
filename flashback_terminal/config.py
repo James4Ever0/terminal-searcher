@@ -46,6 +46,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "config_file": None,  # Path to custom screenrc (escape '' for kiosk mode)
             "init_commands": [
                 "unset STY",
+                "unset SCREENDIR",
                 "clear",
             ],
         },

@@ -918,13 +918,8 @@ unsetenv STY
 
         # Fallback to screen resize commands
         try:
-            # Set the window size using screen's builtin commands
             self._run_screen([
-                "-X", "resize", "-h", str(rows)
-            ], check=False)
-            
-            self._run_screen([
-                "-X", "resize", "-v", str(cols)
+                "-X", "fit"
             ], check=False)
             
             logger.debug(f"[ScreenSession] Resized to {rows}x{cols} using screen commands")
