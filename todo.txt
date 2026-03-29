@@ -11,3 +11,8 @@
 - [ ] how should we order search results? by terminal id? terminal title? or by time? similarity? hybrid (time + similarity)? can we filter out those inactive sessions? can we specify time range in search?
 - [ ] add attach option to "running session" in listing and searched candidates
 - [ ] checkout how to set title in xterm.js for each terminal tab, and use xtitle to test it. (but seems konsole does it differently)
+- [ ] improve subword search efficiency, like "james" in "jamesbrown"
+    - by using bm25s? https://github.com/xhluca/bm25s
+    - or just to use pystemmer after jieba tokenization? https://github.com/snowballstem/pystemmer 
+- [ ] close all sessions spinned up by session_manager by using atexit.register, if config file or default config say so. make such config entry to determine whether to "stop" all sessions at exit.
+- [ ] keyword highlight in search candidates
