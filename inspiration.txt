@@ -3,3 +3,5 @@ do not create web terminal poll yourself. instead, just spin up a tmux session a
 we call this executable "flashback-shell", like it or not, you can use it.
 
 we may even use a different programming language to compile it into static executable, since it would be simple to implement.
+
+however, we may have difficulty "finding/connecting" to the terminal. we may still have to interact, attach and manage it in the web terminal. otherwise we have to spin up a new one instead, kill the old one first?
