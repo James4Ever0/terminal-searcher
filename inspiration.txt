@@ -1,0 +1,5 @@
+do not create web terminal poll yourself. instead, just spin up a tmux session and attach to it, read terminal environments, pass them directly to newly created tmux session, notify the server side worker, use existing terminal emulator or gui, attach to it in the emulator, then collect everything in backend. no more websockets.
+
+we call this executable "flashback-shell", like it or not, you can use it.
+
+we may even use a different programming language to compile it into static executable, since it would be simple to implement.
