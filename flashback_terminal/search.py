@@ -3,12 +3,12 @@
 import math
 import re
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from flashback_terminal.logger import logger
 
 try:
-    # TODO: use jieba instead of nltk.
     import jieba
 
     JIEBA_AVAILABLE = True
@@ -31,12 +31,12 @@ class BM25Search:
 
     def _tokenize(self, text: str) -> List[str]:
         if JIEBA_AVAILABLE:
-            return list(jieba.cut(text.lower()))
+            return list(jieba.lcut_for_search(text.lower()))
         return re.findall(r"\b\w+\b", text.lower())
 
     def _build_index(self) -> None:
         with self.db._connect() as conn:
-            rows = conn.execute("SELECT id, session_id, content FROM terminal_output").fetchall()
+            rows = conn.execute("SELECT id, session_id, text_content FROM terminal_captures WHERE text_content IS NOT NULL").fetchall()
         
         logger.debug(f"[BM25Search] Building index from {len(rows)} terminal output records")
 
@@ -49,7 +49,7 @@ class BM25Search:
 
         for row in rows:
             doc_id = row["id"]
-            content = row["content"]
+            content = row["text_content"]
 
             tokens = self._tokenize(content)
             self.documents[doc_id] = {"session_id": row["session_id"], "content": content}
@@ -236,13 +236,13 @@ class SearchEngine:
 
         enriched = []
         for doc_id, score in results:
-            output = self.db.get_terminal_output_by_id(doc_id)
-            if output:
-                session = self.db.get_session(output.session_id)
+            capture = self.db.get_terminal_capture_by_id(doc_id)
+            if capture:
+                session = self.db.get_session(capture["session_id"])
                 
                 # Apply time range filter if specified
                 if time_range:
-                    timestamp = output.timestamp
+                    timestamp = datetime.fromisoformat(capture["timestamp"])
                     now = datetime.now()
                     if time_range == "1h" and (now - timestamp).total_seconds() > 3600:
                         continue
@@ -259,14 +259,13 @@ class SearchEngine:
                 
                 enriched.append(
                     {
-                        "output_id": doc_id,
-                        "session_id": output.session_id,
+                        "capture_id": doc_id,
+                        "session_id": capture["session_id"],
                         "session_uuid": session.uuid if session else None,
                         "session_name": session.name if session else None,
                         "session_status": session.status if session else None,
-                        "sequence_num": output.sequence_num,
-                        "timestamp": output.timestamp.isoformat(),
-                        "content": output.content,
+                        "timestamp": capture["timestamp"],
+                        "content": capture["text_content"],
                         "score": score,
                     }
                 )
