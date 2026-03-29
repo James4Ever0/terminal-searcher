@@ -5,6 +5,7 @@
 
 logs/*
 log.txt
+*.ansi
 
 __pycache__/
 *.py[cod]
