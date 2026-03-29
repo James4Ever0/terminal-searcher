@@ -115,17 +115,40 @@ class TerminalWebSocketHandler:
                     await asyncio.sleep(0.1)
             if not session_ready:
                 logger.error("Session is not ready after 1 second. Disconnecting.")
-            while session_ready:
-                # TODO: create two asyncio tasks, wait till one of them completes, then terminate.
-                data = await session.read(timeout=0.05)
+            # Create two asyncio looping tasks: one for terminal output, one for websocket messages
+            async def read_terminal():
+                while session_ready:
+                    data = await session.read(timeout=0.05)
+                    if not await session.is_running():
+                        break
+            
+            async def read_websocket():
+                while True:
+                    try:
+                        message = await websocket.receive_text()
+                        await self._handle_message(websocket, session, message)
+                    except WebSocketDisconnect:
+                        break
+                    except Exception as e:
+                        logger.error(f"WebSocket receive error: {e}")
+                        break
+            
+            terminal_task = asyncio.create_task(read_terminal())
+            websocket_task = asyncio.create_task(read_websocket())
+            
+            # Wait till one of them completes, then terminate
+            done, pending = await asyncio.wait(
+                [terminal_task, websocket_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel any pending tasks
+            for task in pending:
+                task.cancel()
                 try:
-                    message = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
-                    await self._handle_message(websocket, session, message)
-                except asyncio.TimeoutError:
+                    await task
+                except asyncio.CancelledError:
                     pass
-
-                if not await session.is_running():
-                    break
 
         except WebSocketDisconnect:
             pass

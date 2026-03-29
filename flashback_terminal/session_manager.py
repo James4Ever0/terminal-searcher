@@ -1076,7 +1076,7 @@ unsetenv STY
             # First check if screen reports the session as running
             result = await self._run_screen([
                 "-ls",
-            ], check=False)
+            ], check=False, get_output=True)
             # Check if our session name appears in the output
             if not (self._session_name in result.stdout or str(self._socket_path) in result.stdout):
                 logger.debug(f"[ScreenSession] Session {self._session_name} not found by screen")

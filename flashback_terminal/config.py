@@ -62,6 +62,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             },
             "init_commands": [
                 "unset TMUX",
+                "unset TMUX_TMPDIR",
                 "unset TMUX_PANE",
                 "unset TMUX_WINDOW",
                 "unset TMUX_SESSION",
