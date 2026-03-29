@@ -17,4 +17,4 @@
 - [ ] close all sessions spinned up by session_manager by using atexit.register, if config file or default config say so. make such config entry to determine whether to "stop" all sessions at exit.
 - [ ] keyword highlight in search candidates
 - [ ] make terminal workers threaded per backend attached tmux/screen process, and do not constantly poll them. instead, use event driven approach, like using tornado process protocol. make sure we will use no async await in code, including websocket. make sure each thread is separated.
-- [ ] separate terminal server and webui, first spin up server from cli to receive terminal creation, reconnect request, then webui just attach to the server designated socket and method, perform search etc.
+- [ ] separate terminal server and webui, first spin up server from cli to receive terminal creation, reconnect request, do periodic tasks and run workers, then webui just attach to the server designated socket and method, perform search etc.
