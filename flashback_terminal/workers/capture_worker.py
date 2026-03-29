@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from flashback_terminal.config import get_config
 from flashback_terminal.database import Database
 from flashback_terminal.logger import Logger, log_function, logger
-from flashback_terminal.session_manager import SessionManager, SessionCapture
+from flashback_terminal.session_manager import SessionManager, SessionCapture, get_session_manager
 
 
 class CaptureWorker:
@@ -24,7 +24,7 @@ class CaptureWorker:
     def __init__(self, db: Database):
         self.db = db
         self.config = get_config()
-        self.session_manager = SessionManager()
+        self.session_manager = get_session_manager()
         self._running = False
         self._last_capture: Dict[str, float] = {}  # session_id -> timestamp
 
@@ -57,31 +57,35 @@ class CaptureWorker:
     def start(self) -> None:
         """Start the capture worker."""
         if not self.enabled:
-            logger.info("Capture worker disabled in config")
+            logger.info("[CaptureWorker] Capture worker disabled in config")
             return
 
         if not self._has_renderer:
-            logger.warning("Capture worker started but agg_python_bindings not available")
+            logger.warning("[CaptureWorker] Capture worker started but agg_python_bindings not available")
             # Still capture text content even without renderer
 
         self._running = True
-        logger.info(f"Capture worker started (interval: {self.interval_seconds}s)")
+        logger.info(f"[CaptureWorker] Capture worker started (interval: {self.interval_seconds}s)")
 
     def stop(self) -> None:
         """Stop the capture worker."""
         self._running = False
-        logger.info("Capture worker stopped")
+        logger.info("[CaptureWorker] Capture worker stopped")
 
     def capture_all_sessions(self) -> List[Dict[str, Any]]:
         """Capture all active sessions."""
         if not self._running:
+            logger.info("[CaptureWorker] Capture worker not running")
             return []
 
         results = []
         sessions = self.session_manager.list_sessions()
+        logger.debug(f"[CaptureWorker] Found {len(sessions)} sessions")
 
         for session_info in sessions:
+            logger.debug(f"[CaptureWorker] Processing session {session_info.session_id}")
             if not session_info.is_running:
+                logger.debug(f"[CaptureWorker] Skipping inactive session {session_info.session_id}")
                 continue
 
             # Check if enough time has passed since last capture
@@ -90,12 +94,16 @@ class CaptureWorker:
             current_time = time.time()
 
             if current_time - last_time < self.interval_seconds:
+                logger.debug(f"[CaptureWorker] Skipping capture for {session_id} (too soon)")
                 continue
 
             result = self.capture_session(session_id)
-            if result:
-                results.append(result)
-                self._last_capture[session_id] = current_time
+            if not result:
+                logger.warning(f"[CaptureWorker] Failed to capture session {session_id}")
+                continue
+            logger.info(f"[CaptureWorker] Captured session {session_id}")
+            results.append(result)
+            self._last_capture[session_id] = current_time
 
         return results
 
@@ -107,15 +115,22 @@ class CaptureWorker:
             capture = self.session_manager.capture_session(
                 session_id, full_scrollback=self.capture_full_scrollback
             )
+            session_terminal_size = self.session_manager.get_session(session_id)._terminal_size
+            if session_terminal_size:
+                cols=session_terminal_size.get('cols', 0)
+                rows=session_terminal_size.get('rows', 0)
+            else:
+                cols=-1
+                rows=-1
 
             if not capture:
-                logger.debug(f"No capture data for session {session_id}")
+                logger.debug(f"[CaptureWorker] No capture data for session {session_id}")
                 return None
 
             # Get database session record
             db_session = self.db.get_session_by_uuid(session_id)
             if not db_session:
-                logger.warning(f"Session {session_id} not found in database")
+                logger.warning(f"[CaptureWorker] Session {session_id} not found in database")
                 return None
 
             # Determine capture type
@@ -126,7 +141,7 @@ class CaptureWorker:
             screenshot_path = None
             if capture.ansi and self._has_renderer:
                 screenshot_path = self._render_screenshot(
-                    session_id, db_session.id, capture.ansi
+                    session_id, db_session.id, capture.ansi, cols=cols, rows=rows
                 )
 
             # Save text content (OCR result)
@@ -145,7 +160,7 @@ class CaptureWorker:
                 },
             )
 
-            logger.debug(f"Captured session {session_id}: capture_id={capture_id}")
+            logger.debug(f"[CaptureWorker] Captured session {session_id}: capture_id={capture_id}")
 
             return {
                 "capture_id": capture_id,
@@ -156,17 +171,18 @@ class CaptureWorker:
             }
 
         except Exception as e:
-            logger.error(f"Failed to capture session {session_id}: {e}")
+            logger.error(f"[CaptureWorker] Failed to capture session {session_id}: {e}")
             return None
 
     def _render_screenshot(
-        self, session_uuid: str, session_db_id: int, ansi_content: str
+        self, session_uuid: str, session_db_id: int, ansi_content: str, cols:int, rows:int, 
     ) -> Optional[str]:
         """Render ANSI content to PNG screenshot.
 
         Uses agg_python_bindings.TerminalEmulator to render terminal output.
         """
         if not self._renderer:
+            logger.warning("[CaptureWorker] Renderer not available, skipping screenshot")
             return None
 
         try:
@@ -180,23 +196,27 @@ class CaptureWorker:
             filepath = screenshot_dir / filename
 
             # Determine terminal size (default 80x24 or from config)
-            cols = self.config.get("terminal.cols", 80)
-            rows = self.config.get("terminal.rows", 24)
+            if cols > 0 and rows > 0:
+                logger.debug("[CaptureWorker] Use session provided terminal size: cols=%s, rows=%s" % (cols, rows))
+            else:
+                cols = self.config.get("terminal.cols", 80)
+                rows = self.config.get("terminal.rows", 24)
+                logger.debug("[CaptureWorker] Session terminal size not found, use config fallback: cols=%s, rows=%s" % (cols, rows))
 
             # Count actual lines in ANSI content to adjust rows
-            line_count = len(ansi_content.splitlines())
-            rows = max(rows, min(line_count, 100))  # Cap at 100 rows
+            # line_count = len(ansi_content.splitlines())
+            # rows = max(rows, min(line_count, 100))  # Cap at 100 rows
 
             # Create terminal emulator and render
             emulator = self._renderer.TerminalEmulator(cols, rows)
             emulator.feed_str(ansi_content)
             emulator.screenshot(str(filepath))
 
-            logger.debug(f"Rendered screenshot: {filepath}")
+            logger.debug(f"[CaptureWorker] Rendered screenshot: {filepath}")
             return str(filepath)
 
         except Exception as e:
-            logger.error(f"Failed to render screenshot: {e}")
+            logger.error(f"[CaptureWorker] Failed to render screenshot: {e}")
             return None
 
     def run_once(self) -> List[Dict[str, Any]]:
@@ -218,16 +238,17 @@ class CaptureWorkerScheduler:
 
         # Note: In production, this would use APScheduler or similar
         # For now, we just start the worker and let the caller manage scheduling
-        logger.info("Capture scheduler started")
+        logger.info("[CaptureWorkerScheduler] Capture scheduler started")
 
     def stop(self) -> None:
         """Stop the scheduler."""
         self._running = False
         self.worker.stop()
-        logger.info("Capture scheduler stopped")
+        logger.info("[CaptureWorkerScheduler] Capture scheduler stopped")
 
     def run_captures(self) -> List[Dict[str, Any]]:
         """Run captures for all sessions."""
         if not self._running:
+            logger.info("[CaptureWorkerScheduler] Capture scheduler not running")
             return []
         return self.worker.capture_all_sessions()

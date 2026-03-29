@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from flashback_terminal.config import get_config
 from flashback_terminal.logger import Logger, log_function, logger
 
+_singleton_session_manager = None
 
 class SessionManagerError(Exception):
     """Error raised by session manager."""
@@ -121,6 +122,7 @@ class BaseSession(ABC):
         self._sequence_num = 0
         self._cwd: Optional[str] = None
         self._created_at = time.time()
+        self._terminal_size: Optional[dict[str, int]] = None
 
     @abstractmethod
     def start(self) -> bool:
@@ -168,6 +170,7 @@ class BaseSession(ABC):
     def _log_output(self, content: str) -> None:
         """Log output for history keeper."""
         self._sequence_num += 1
+        logger.debug(f"[{self.__class__.__name__}] Logging output (seq={self._sequence_num}, len={len(content)}): {content[:50]}...")
         if self.on_output:
             self.on_output(content)
 
@@ -463,9 +466,12 @@ set -g default-terminal "screen-256color"
                 # Fall back to capture-pane
 
         try:
+            # Use capture-pane with -S - to get only the bottom line (newest content)
+            # This avoids capturing the entire screen content every time
             result = self._run_tmux([
                 "capture-pane",
                 "-p",  # Print to stdout
+                "-J",  # Join wrapped lines
                 "-t", self._target,
             ], check=False)
 
@@ -473,10 +479,18 @@ set -g default-terminal "screen-256color"
                 text = result.stdout
                 if text == self._last_output:
                     return None
+                
                 self._last_output = text
                 self.on_clear()
-                # TODO: rstrip text before sending to frontend does not help very well.
-                self._log_output(text)
+                if self._last_output:
+                    # Calculate what's new by comparing with last output
+                    if text.startswith(self._last_output):
+                        new_content = text[len(self._last_output):]
+                        if new_content.strip():  # Only log if there's actual new content
+                            self._log_output(new_content)
+                    else:
+                        # Content changed significantly, log everything
+                        self._log_output(text)
                 col, row = self._get_cursor()
                 self.on_cursor(col, row)
                 self._read_mode = "capture_pane"
@@ -550,6 +564,7 @@ set -g default-terminal "screen-256color"
 
     def resize(self, rows: int, cols: int) -> None:
         """Resize tmux window."""
+        self._terminal_size = dict(rows=rows, cols=cols)
         # Try to resize pty directly
         if self._pty_fd is not None:
             try:
@@ -884,6 +899,8 @@ unsetenv STY
 
     def resize(self, rows: int, cols: int) -> None:
         """Resize screen window."""
+        self._terminal_size = dict(rows=rows, cols=cols)
+
         # TODO: row wise resize is not good for gnu screen. also the row position is not good when we attach to it from the web interface.
         
         # Try to resize pty directly
@@ -891,9 +908,28 @@ unsetenv STY
             try:
                 size = struct.pack("HHHH", rows, cols, 0, 0)
                 fcntl.ioctl(self._pty_fd, termios.TIOCSWINSZ, size)
+
+                self._run_screen([
+                    "-X", "fit"
+                ], check=False)
                 return
             except Exception as e:
-                logger.debug(f"[ScreenSession] Pty resize failed, falling back to stty: {e}")
+                logger.debug(f"[ScreenSession] Pty resize failed, falling back to screen resize: {e}")
+
+        # Fallback to screen resize commands
+        try:
+            # Set the window size using screen's builtin commands
+            self._run_screen([
+                "-X", "resize", "-h", str(rows)
+            ], check=False)
+            
+            self._run_screen([
+                "-X", "resize", "-v", str(cols)
+            ], check=False)
+            
+            logger.debug(f"[ScreenSession] Resized to {rows}x{cols} using screen commands")
+        except Exception as e:
+            logger.debug(f"[ScreenSession] Screen resize error: {e}")
 
 
     def is_running(self) -> bool:
@@ -1065,4 +1101,8 @@ class SessionManager:
 
 def get_session_manager() -> SessionManager:
     """Get or create the global session manager instance."""
-    return SessionManager()
+    global _singleton_session_manager
+    if not _singleton_session_manager:
+        _singleton_session_manager = SessionManager()
+
+    return _singleton_session_manager

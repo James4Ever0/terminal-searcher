@@ -63,10 +63,13 @@ class TerminalTab {
         FrontendLogger.debug(`TerminalTab constructor: uuid=${uuid}, name=${name}`);
         this.uuid = uuid;
         this.name = name;
+        this.originalName = name; // Store original name
         this.terminal = null;
         this.socket = null;
         this.fitAddon = null;
         this.screenshotInterval = null;
+        this.titleOverride = null; // Allow manual title override
+        this.lastDetectedTitle = null; // Track auto-detected titles
     }
 
     async connect() {
@@ -119,6 +122,8 @@ class TerminalTab {
         // Send input to PTY - PTY will echo back for display
         this.terminal.onData((data) => {
             if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                // Process escape sequences for title changes
+                // this.processEscapeSequences(data);
                 this.socket.send(JSON.stringify({
                     type: 'input',
                     data: data
@@ -136,6 +141,22 @@ class TerminalTab {
             this.sendResize();
         });
     }
+
+    // processEscapeSequences(data) {
+    //     // Look for OSC (Operating System Command) escape sequences for title changes
+    //     // Pattern: ESC ] 0 ; title BEL or ESC ] 0 ; title ST
+    //     const titlePattern = /\x1b\]0;([^\x07\x1b\\]+)\x07|\x1b\]0;([^\x1b\\]+)\x1b\\/g;
+    //     let match;
+        
+    //     while ((match = titlePattern.exec(data)) !== null) {
+    //         const title = match[1] || match[2];
+    //         if (title && title !== this.lastDetectedTitle) {
+    //             this.lastDetectedTitle = title;
+    //             FrontendLogger.info(`Detected title change from terminal: ${title}`);
+    //             this.handleTitleChange(title);
+    //         }
+    //     }
+    // }
 
     handleMessage(msg) {
         switch (msg.type) {
@@ -165,6 +186,10 @@ class TerminalTab {
             case 'session_info':
                 this.uuid = msg.uuid;
                 this.name = msg.name;
+                this.updateTabTitle();
+                break;
+            case 'title_change':
+                this.handleTitleChange(msg.title);
                 break;
         }
     }
@@ -218,6 +243,42 @@ class TerminalTab {
         this.terminal.focus();
     }
 
+    handleTitleChange(title) {
+        FrontendLogger.info(`Title change received: ${title}`);
+        this.titleOverride = title;
+        this.updateTabTitle();
+    }
+
+    updateTabTitle() {
+        const displayName = this.titleOverride || this.name || this.originalName;
+        FrontendLogger.debug(`Updating tab title to: ${displayName}`);
+        
+        // Update tab element if it exists
+        if (this.app && this.app.activeTab === this) {
+            this.app.renderTabs();
+        }
+        
+        // Set window title if this is the active tab
+        if (this.app && this.app.activeTab === this) {
+            document.title = `${displayName} - flashback-terminal`;
+        }
+        
+        // Send title change to backend to propagate to terminal
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(JSON.stringify({
+                type: 'command',
+                cmd: 'set_title',
+                title: displayName
+            }));
+        }
+    }
+
+    setTitle(title) {
+        FrontendLogger.info(`Manual title set: ${title}`);
+        this.titleOverride = title;
+        this.updateTabTitle();
+    }
+
     dispose() {
         this.stopScreenshotCapture();
         if (this.socket) {
@@ -242,6 +303,11 @@ class App {
             FrontendLogger.debug('New tab button clicked');
             this.createTab();
         });
+
+        document.getElementById('btn-set-title').addEventListener('click', () => {
+            FrontendLogger.debug('Set title button clicked');
+            this.setActiveTabTitle();
+        });
         document.getElementById('btn-search').addEventListener('click', () => this.openSearch());
         document.getElementById('btn-sessions').addEventListener('click', () => this.openSessions());
 
@@ -254,6 +320,24 @@ class App {
         document.getElementById('btn-do-search').addEventListener('click', () => this.doSearch());
 
         await this.createTab();
+    }
+
+    setActiveTabTitle() {
+        if (!this.activeTab) {
+            FrontendLogger.warn('No active tab to set title for');
+            return;
+        }
+        
+        const titleInput = document.getElementById('title-input');
+        const newTitle = titleInput.value.trim();
+        
+        if (newTitle) {
+            FrontendLogger.info(`Setting title for active tab: ${newTitle}`);
+            this.activeTab.setTitle(newTitle);
+            titleInput.value = ''; // Clear input after setting
+        } else {
+            FrontendLogger.warn('Empty title provided, ignoring');
+        }
     }
 
     async createTab() {
@@ -275,6 +359,7 @@ class App {
         FrontendLogger.info(`Session created: uuid=${data.uuid}`);
 
         const tab = new TerminalTab(data.uuid, data.name);
+        tab.app = this; // Set app reference
         this.tabs.push(tab);
         await tab.connect();
         this.switchTab(tab);
@@ -289,6 +374,10 @@ class App {
         tab.terminal.element.style.display = 'block';
         tab.focus();
         this.renderTabs();
+        
+        // Update window title to reflect active tab
+        const displayName = tab.titleOverride || tab.name || tab.originalName;
+        document.title = `${displayName} - flashback-terminal`;
     }
 
     renderTabs() {
@@ -298,7 +387,9 @@ class App {
         for (const tab of this.tabs) {
             const tabEl = document.createElement('div');
             tabEl.className = 'tab' + (tab === this.activeTab ? ' active' : '');
-            tabEl.textContent = tab.name;
+            const displayName = tab.titleOverride || tab.name || tab.originalName;
+            tabEl.textContent = displayName;
+            tabEl.title = `Session: ${tab.originalName}\nCurrent: ${displayName}\nUUID: ${tab.uuid}`;
             tabEl.addEventListener('click', () => this.switchTab(tab));
             container.appendChild(tabEl);
         }

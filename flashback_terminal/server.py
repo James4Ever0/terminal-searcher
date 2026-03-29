@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import threading
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -35,6 +36,9 @@ class SearchRequest(BaseModel):
     scope: str = "all"
     session_ids: Optional[List[str]] = None
     limit: int = 50
+    order_by: str = "relevance"  # "relevance", "time", "session_name", "hybrid"
+    time_range: Optional[str] = None  # "1h", "24h", "7d", "30d", "all"
+    filter_inactive: bool = False
 
 
 @asynccontextmanager
@@ -86,7 +90,10 @@ async def lifespan(app: FastAPI):
         global capture_scheduler
         capture_scheduler = CaptureWorkerScheduler(db)
         capture_scheduler.start()
-        asyncio.create_task(capture_scheduler_task())
+        # loop = asyncio.new_event_loop()
+        # loop.create_task(capture_scheduler_thread())
+        # threading.Thread(target=loop.run_forever, daemon=True).start()
+        asyncio.create_task(capture_scheduler_thread())
         logger.info("Capture scheduler initialized")
     else:
         logger.warning("Capture scheduler disabled")
@@ -100,6 +107,35 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete")
 
 
+async def capture_scheduler_thread():
+    """Background thread for terminal capture."""
+    config = get_config()
+    interval = config.get("session_manager.capture.interval_seconds", 10)
+
+    if not capture_scheduler:
+        logger.info("[capture_scheduler_thread] Capture scheduler not initialized")
+        return
+    if not capture_scheduler._running:
+        logger.info("[capture_scheduler_thread] Capture scheduler initialized but not running")
+
+    logger.info(f"[capture_scheduler_thread] Capture scheduler running (interval: {interval}s)")
+
+    while capture_scheduler and capture_scheduler._running:
+        logger.debug(f"[capture_scheduler_thread] Sleeping for {interval} seconds")
+        await asyncio.sleep(interval)
+        logger.debug(f"[capture_scheduler_thread] Waking up")
+        try:
+            results = capture_scheduler.run_captures()
+            if results:
+                logger.debug(f"[capture_scheduler_thread] Captured {len(results)} sessions")
+            else:
+                logger.debug("[capture_scheduler_thread] No sessions captured")
+        except Exception as e:
+            logger.error(f"[capture_scheduler_thread] Capture error: {e}")
+    logger.debug("[capture_scheduler_thread] Capture scheduler is down")
+    
+
+
 async def retention_scheduler():
     """Background task for retention management."""
     config = get_config()
@@ -109,23 +145,6 @@ async def retention_scheduler():
         await asyncio.sleep(interval)
         if retention_manager:
             retention_manager.run_cleanup()
-
-
-async def capture_scheduler_task():
-    """Background task for terminal capture."""
-    config = get_config()
-    interval = config.get("session_manager.capture.interval_seconds", 10)
-
-    logger.info(f"Capture scheduler running (interval: {interval}s)")
-    while True:
-        await asyncio.sleep(interval)
-        if capture_scheduler:
-            try:
-                results = capture_scheduler.run_captures()
-                if results:
-                    logger.debug(f"Captured {len(results)} sessions")
-            except Exception as e:
-                logger.error(f"Capture error: {e}")
 
 
 app = FastAPI(title="flashback-terminal", lifespan=lifespan)
@@ -183,6 +202,69 @@ async def terminal_websocket(websocket: WebSocket, session_uuid: str):
         await ws_handler.handle(websocket, session_uuid)
 
 
+@app.post("/api/sessions/{session_uuid}/attach")
+@log_function(Logger.DEBUG)
+async def attach_to_session(session_uuid: str):
+    """Attach to an existing terminal session."""
+    logger.info(f"Attach request for session: {session_uuid}")
+    
+    if not terminal_manager:
+        logger.error("Terminal manager not available")
+        raise HTTPException(status_code=503, detail="Terminal manager not available")
+    
+    # Check if session is already running in terminal manager
+    if session_uuid in terminal_manager.sessions:
+        logger.warning(f"Session {session_uuid} is already running in terminal manager")
+        raise HTTPException(status_code=409, detail="Session is already running")
+    
+    # Get session from database
+    session = db.get_session_by_uuid(session_uuid)
+    if not session:
+        logger.error(f"Session {session_uuid} not found in database")
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.status not in ("active", "running"):
+        logger.error(f"Session {session_uuid} is not active (status: {session.status})")
+        raise HTTPException(status_code=400, detail="Session is not active")
+    
+    try:
+        # Create a terminal session from existing database session
+        from flashback_terminal.terminal import TerminalSession
+        
+        profile = get_config().get_profile(session.profile_name) or {}
+        terminal_session = TerminalSession(
+            session_id=session.id,
+            uuid=session.uuid,
+            db=db,
+            profile=profile,
+        )
+        
+        # Try to attach to existing session manager session
+        # This requires the session manager to support reattaching
+        session_manager = terminal_manager.session_manager
+        existing_session = session_manager.get_session(session_uuid)
+        
+        if existing_session and existing_session.is_running():
+            # Create a new terminal session that wraps the existing backend session
+            terminal_session._session = existing_session
+            terminal_session._running = True
+            terminal_manager.sessions[session_uuid] = terminal_session
+            
+            logger.info(f"Successfully attached to session {session_uuid}")
+            return {
+                "session_uuid": session_uuid,
+                "status": "attached",
+                "message": "Successfully attached to session"
+            }
+        else:
+            logger.error(f"Session {session_uuid} backend is not running")
+            raise HTTPException(status_code=400, detail="Session backend is not running")
+            
+    except Exception as e:
+        logger.error(f"Failed to attach to session {session_uuid}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to attach to session: {str(e)}")
+
+
 @app.get("/api/sessions")
 @log_function(Logger.DEBUG)
 async def list_sessions(
@@ -194,6 +276,12 @@ async def list_sessions(
     logger.debug(f"list_sessions called: status={status}, limit={limit}, offset={offset}")
 
     sessions = db.list_sessions(status=status, limit=limit, offset=offset)
+    
+    # Check which sessions are currently running in terminal manager
+    # TODO: attach to previous running sessions in db?
+    running_sessions = set()
+    if terminal_manager:
+        running_sessions = set(terminal_manager.sessions.keys())
 
     logger.info(f"Listed {len(sessions)} sessions (status={status}, limit={limit})")
 
@@ -207,6 +295,8 @@ async def list_sessions(
                 "created_at": s.created_at.isoformat(),
                 "status": s.status,
                 "last_cwd": s.last_cwd,
+                "is_running": s.uuid in running_sessions,
+                "can_attach": s.status in ("active", "running") and s.uuid not in running_sessions,
             }
             for s in sessions
         ]
@@ -314,6 +404,9 @@ async def search(request: SearchRequest):
         scope=request.scope,
         session_ids=target_session_ids,
         limit=request.limit,
+        order_by=request.order_by,
+        time_range=request.time_range,
+        filter_inactive=request.filter_inactive,
     )
 
     logger.info(f"Search completed: found {len(results)} results")

@@ -16,6 +16,7 @@ from flashback_terminal.session_manager import (
     BaseSession,
     SessionManager,
     SessionCapture,
+    get_session_manager,
 )
 
 
@@ -40,6 +41,8 @@ class TerminalSession:
         self.on_cursor = on_cursor
         self.profile = profile
 
+        self._terminal_size :Dict[str, int] = dict(rows=-1,cols=-1)
+
         self._session: Optional[BaseSession] = None
         self.sequence_num = 0
         self._cwd: Optional[str] = None
@@ -57,9 +60,11 @@ class TerminalSession:
     def _on_session_output(self, content: str) -> None:
         """Handle output from underlying session."""
         config = get_config()
+        logger.debug(f"[TerminalSession] Received output (len={len(content)}): {content[:50]}...")
 
         if config.is_module_enabled("history_keeper"):
             self.sequence_num += 1
+            logger.debug(f"[TerminalSession] Storing output in database (session_id={self.session_id}, seq={self.sequence_num})")
             self.db.insert_terminal_output(
                 self.session_id, self.sequence_num, content, "output"
             )
@@ -73,7 +78,7 @@ class TerminalSession:
         logger.info(f"Starting terminal session: uuid={self.uuid}, profile={self.profile.get('name', 'default')}")
 
         config = get_config()
-        session_manager = SessionManager()
+        session_manager = get_session_manager()
 
         self._session = session_manager.create_session(
             session_id=self.uuid,
@@ -94,8 +99,13 @@ class TerminalSession:
 
     def resize(self, rows: int, cols: int) -> None:
         """Resize the terminal."""
+        logger.debug(f"[TerminalSession] Resize request: rows={rows}, cols={cols}")
         if self._session:
+            logger.debug(f"[TerminalSession] Forwarding resize to session {self._session.__class__.__name__}")
             self._session.resize(rows, cols)
+            self._terminal_size = dict(rows=rows,cols=cols)
+        else:
+            logger.warning(f"[TerminalSession] Cannot resize - no active session")
 
     def write(self, data: str) -> None:
         """Write data to the terminal."""

@@ -13,7 +13,7 @@ from PIL import Image
 from flashback_terminal.config import get_config
 from flashback_terminal.database import Database
 from flashback_terminal.terminal import TerminalManager, TerminalSession
-
+from flashback_terminal.logger import logger
 
 class TerminalWebSocketHandler:
     """Handles WebSocket connections for terminal sessions."""
@@ -124,17 +124,48 @@ class TerminalWebSocketHandler:
             if msg_type == "input":
                 session.write(msg.get("data", ""))
             elif msg_type == "resize":
-                session.resize(msg.get("rows", 24), msg.get("cols", 80))
+                rows = msg.get("rows", 24)
+                cols = msg.get("cols", 80)
+                logger.debug(f"[WebSocket] Resize request: rows={rows}, cols={cols}")
+                session.resize(rows, cols)
             elif msg_type == "command":
                 cmd = msg.get("cmd")
                 if cmd == "rename":
                     session.db.update_session(
                         session.session_id, name=msg.get("name", "Unnamed")
                     )
+                elif cmd == "set_title":
+                    title = msg.get("title", "")
+                    if title:
+                        # Send title change to frontend for other tabs
+                        await self._handle_title_change(session, title)
+                        # TODO: set title in terminal using escape sequence
+                        # session.write(f"\x1b]0;{title}\x07")
                 elif cmd == "screenshot_upload":
                     await self._handle_screenshot_upload(session, msg)
         except json.JSONDecodeError:
             session.write(message)
+
+    async def _handle_title_change(
+        self, session: TerminalSession, title: str
+    ) -> None:
+        """Handle title change and broadcast to all connected clients."""
+        logger.debug(f"[WebSocket] Title change: session={session.uuid}, title={title}")
+        
+        # Broadcast title change to all clients connected to this session
+        message = {
+            "type": "title_change",
+            "title": title,
+            "uuid": session.uuid
+        }
+        
+        # Send to all connected WebSocket clients
+        if hasattr(self, 'connections') and session.uuid in self.connections:
+            for websocket in self.connections[session.uuid]:
+                try:
+                    await websocket.send_text(json.dumps(message))
+                except Exception as e:
+                    logger.debug(f"[WebSocket] Failed to send title change: {e}")
 
     async def _handle_screenshot_upload(
         self, session: TerminalSession, msg: dict

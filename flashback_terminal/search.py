@@ -5,14 +5,15 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from flashback_terminal.logger import logger
 
 try:
-    import nltk
-    from nltk.tokenize import word_tokenize
+    # TODO: use jieba instead of nltk.
+    import jieba
 
-    NLTK_AVAILABLE = True
+    JIEBA_AVAILABLE = True
 except ImportError:
-    NLTK_AVAILABLE = False
+    JIEBA_AVAILABLE = False
 
 from flashback_terminal.config import get_config
 from flashback_terminal.database import Database
@@ -29,13 +30,15 @@ class BM25Search:
         self._build_index()
 
     def _tokenize(self, text: str) -> List[str]:
-        if NLTK_AVAILABLE:
-            return word_tokenize(text.lower())
+        if JIEBA_AVAILABLE:
+            return list(jieba.cut(text.lower()))
         return re.findall(r"\b\w+\b", text.lower())
 
     def _build_index(self) -> None:
         with self.db._connect() as conn:
             rows = conn.execute("SELECT id, session_id, content FROM terminal_output").fetchall()
+        
+        logger.debug(f"[BM25Search] Building index from {len(rows)} terminal output records")
 
         self.documents: Dict[int, Dict] = {}
         self.doc_lengths: Dict[int, int] = {}
@@ -63,6 +66,7 @@ class BM25Search:
 
         self.N = len(self.documents)
         self.avg_dl = total_length / self.N if self.N > 0 else 0
+        logger.debug(f"[BM25Search] Index built: {self.N} documents, avg length={self.avg_dl:.2f}")
 
     def search(
         self, query: str, session_ids: Optional[List[int]] = None, top_k: int = 50
@@ -199,10 +203,14 @@ class SearchEngine:
         scope: str = "all",
         session_ids: Optional[List[int]] = None,
         limit: int = 50,
+        order_by: str = "relevance",
+        time_range: Optional[str] = None,
+        filter_inactive: bool = False,
     ) -> List[Dict]:
         if mode == "text":
             if not self.bm25:
                 return []
+            self.bm25._build_index()
             results = self.bm25.search(query, session_ids, limit)
 
         elif mode == "semantic":
@@ -215,6 +223,7 @@ class SearchEngine:
             embedding_results = []
 
             if self.bm25:
+                self.bm25._build_index()
                 bm25_results = self.bm25.search(query, session_ids, limit * 2)
             if self.embedding:
                 embedding_results = self.embedding.search(query, session_ids, limit * 2)
@@ -230,12 +239,31 @@ class SearchEngine:
             output = self.db.get_terminal_output_by_id(doc_id)
             if output:
                 session = self.db.get_session(output.session_id)
+                
+                # Apply time range filter if specified
+                if time_range:
+                    timestamp = output.timestamp
+                    now = datetime.now()
+                    if time_range == "1h" and (now - timestamp).total_seconds() > 3600:
+                        continue
+                    elif time_range == "24h" and (now - timestamp).total_seconds() > 86400:
+                        continue
+                    elif time_range == "7d" and (now - timestamp).days > 7:
+                        continue
+                    elif time_range == "30d" and (now - timestamp).days > 30:
+                        continue
+                
+                # Apply inactive session filter if specified
+                if filter_inactive and session and session.status != "active":
+                    continue
+                
                 enriched.append(
                     {
                         "output_id": doc_id,
                         "session_id": output.session_id,
                         "session_uuid": session.uuid if session else None,
                         "session_name": session.name if session else None,
+                        "session_status": session.status if session else None,
                         "sequence_num": output.sequence_num,
                         "timestamp": output.timestamp.isoformat(),
                         "content": output.content,
@@ -243,4 +271,39 @@ class SearchEngine:
                     }
                 )
 
-        return enriched
+        # Apply ordering
+        if order_by == "time":
+            enriched.sort(key=lambda x: x["timestamp"], reverse=True)
+        elif order_by == "session_name":
+            enriched.sort(key=lambda x: (x["session_name"] or "", x["timestamp"]), reverse=True)
+        elif order_by == "hybrid":
+            # Hybrid: combine time and relevance (70% relevance, 30% recency)
+            now = datetime.now()
+            for item in enriched:
+                timestamp = datetime.fromisoformat(item["timestamp"].replace('Z', '+00:00'))
+                hours_old = (now - timestamp).total_seconds() / 3600
+                time_score = max(0, 1 - hours_old / 168)  # Decay over 1 week
+                item["hybrid_score"] = 0.7 * item["score"] + 0.3 * time_score
+            enriched.sort(key=lambda x: x["hybrid_score"], reverse=True)
+        else:  # relevance (default)
+            enriched.sort(key=lambda x: x["score"], reverse=True)
+
+        # Add attach information
+        # Check which sessions are currently running
+        running_sessions = set()
+        try:
+            # Get terminal manager instance to check running sessions
+            from flashback_terminal.terminal import TerminalManager
+            temp_manager = TerminalManager(self.db)
+            running_sessions = set(temp_manager.sessions.keys())
+        except Exception:
+            pass  # If we can't check running status, continue without it
+        
+        for item in enriched:
+            item["can_attach"] = (
+                item["session_status"] in ("active", "running") and 
+                item["session_uuid"] not in running_sessions
+            )
+            item["is_running"] = item["session_uuid"] in running_sessions
+
+        return enriched[:limit]
