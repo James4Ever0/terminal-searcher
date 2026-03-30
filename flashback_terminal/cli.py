@@ -93,7 +93,19 @@ def serve(ctx, host, port):
 
     from flashback_terminal.server import app
 
-    uvicorn.run(app, host=server_host, port=server_port)
+    uvicorn_log_level = "info"
+    if Logger.get_verbosity() >= 4:
+        uvicorn_log_level = "trace"
+    elif Logger.get_verbosity() >= 3:
+        uvicorn_log_level = "debug"
+    elif Logger.get_verbosity() >= 2:
+        uvicorn_log_level = "info"
+    elif Logger.get_verbosity() >= 1:
+        uvicorn_log_level = "warning"
+    else:
+        uvicorn_log_level = "error"
+
+    uvicorn.run(app, host=server_host, port=server_port, log_level=uvicorn_log_level)
 
 
 @cli.command()

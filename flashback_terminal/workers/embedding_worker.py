@@ -20,14 +20,14 @@ class EmbeddingWorker:
         self.api_config = self.config.get("workers.embedding.text", {})
         self.running = False
 
-    def start(self):
+    async def start(self):
         """Start the worker."""
         self.running = True
         print("[EmbeddingWorker] Started")
 
         while self.running:
             try:
-                self._process_batch()
+                await self._process_batch()
                 time.sleep(self.config.get("workers.embedding.work_interval_seconds", 1))
             except Exception as e:
                 print(f"[EmbeddingWorker] Error: {e}")
@@ -37,24 +37,24 @@ class EmbeddingWorker:
         """Stop the worker."""
         self.running = False
 
-    def _process_batch(self):
+    async def _process_batch(self):
         """Process a batch of unembedded outputs."""
         batch_size = self.config.get("workers.embedding.batch_size", 10)
 
         # Get unprocessed outputs
-        with self.db._connect() as conn:
-            rows = conn.execute(
+        async with self.db._connect() as conn:
+            rows = await (await conn.execute(
                 """SELECT o.* FROM terminal_output o
                    LEFT JOIN embeddings e ON o.id = e.output_chunk_id
                    WHERE e.id IS NULL
                    LIMIT ?""",
                 (batch_size,),
-            ).fetchall()
+            )).fetchall()
 
         for row in rows:
-            self._process_output(row)
+            await self._process_output(row)
 
-    def _process_output(self, row):
+    async def _process_output(self, row):
         """Generate embedding for a single output."""
         content = row["content"]
         output_id = row["id"]
@@ -62,7 +62,7 @@ class EmbeddingWorker:
 
         try:
             embedding = self._get_embedding(content)
-            self._save_embedding(session_id, output_id, embedding)
+            await self._save_embedding(session_id, output_id, embedding)
         except Exception as e:
             print(f"[EmbeddingWorker] Failed to process output {output_id}: {e}")
 
@@ -87,21 +87,21 @@ class EmbeddingWorker:
 
         return response.json()["data"][0]["embedding"]
 
-    def _save_embedding(self, session_id: int, output_id: int, embedding: list):
+    async def _save_embedding(self, session_id: int, output_id: int, embedding: list):
         """Save embedding to database and file."""
         import numpy as np
 
         # Save to file
-        session = self.db.get_session(session_id)
+        session = await self.db.get_session(session_id)
         if session:
             emb_file = Path(self.config.embedding_dir) / f"{session.uuid}.npy"
             np.save(emb_file, np.array(embedding, dtype=np.float32))
 
         # Save reference to database
-        with self.db._connect() as conn:
-            conn.execute(
+        async with self.db._connect() as conn:
+            await conn.execute(
                 """INSERT INTO embeddings (session_id, output_chunk_id, vector_id, model_name)
                    VALUES (?, ?, ?, ?)""",
                 (session_id, output_id, str(output_id), self.api_config.get("model", "unknown")),
             )
-            conn.commit()
+            await conn.commit()

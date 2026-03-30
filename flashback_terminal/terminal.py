@@ -57,7 +57,7 @@ class TerminalSession:
         if self.on_cursor:
             self.on_cursor(col, row)
 
-    def _on_session_output(self, content: str) -> None:
+    async def _on_session_output(self, content: str) -> None:
         """Handle output from underlying session."""
         config = get_config()
         logger.debug(f"[TerminalSession] Received output (len={len(content)}): {content[:50]}...")
@@ -65,7 +65,7 @@ class TerminalSession:
         if config.is_module_enabled("history_keeper"):
             self.sequence_num += 1
             logger.debug(f"[TerminalSession] Storing output in database (session_id={self.session_id}, seq={self.sequence_num})")
-            self.db.insert_terminal_output(
+            await self.db.insert_terminal_output(
                 self.session_id, self.sequence_num, content, "output"
             )
 
@@ -122,12 +122,12 @@ class TerminalSession:
             self._running = False
         return data
 
-    def update_cwd(self, cwd: str) -> None:
+    async def update_cwd(self, cwd: str) -> None:
         """Update the current working directory."""
         self._cwd = cwd
         if self._session:
             self._session.update_cwd(cwd)
-        self.db.update_session(self.session_id, last_cwd=cwd)
+        await self.db.update_session(self.session_id, last_cwd=cwd)
 
     def get_cwd(self) -> Optional[str]:
         """Get the current working directory."""
@@ -170,7 +170,7 @@ class TerminalManager:
         logger.info(f"Attempting to restore session: {session_uuid}")
         
         # Get session info from database
-        db_session = self.db.get_session_by_uuid(session_uuid)
+        db_session = await self.db.get_session_by_uuid(session_uuid)
         if not db_session:
             logger.warning(f"[TerminalManager] Session {session_uuid} not found in database")
             return None
@@ -213,7 +213,7 @@ class TerminalManager:
                     terminal_session._running = True
                     
                     # Update database to reflect actual status - only after confirming socket exists
-                    self.db.update_session(db_session.id, status="active")
+                    await self.db.update_session(db_session.id, status="active")
                     
                     # Add to active sessions
                     self.sessions[session_uuid] = terminal_session
@@ -223,7 +223,7 @@ class TerminalManager:
                 else:
                     logger.warning(f"[TerminalManager] Tmux session {session_uuid} socket not accessible")
                     # Update database to reflect actual status
-                    self.db.update_session(db_session.id, status="inactive")
+                    await self.db.update_session(db_session.id, status="inactive")
                     return None
                     
             elif db_session.session_type == "screen":
@@ -256,7 +256,7 @@ class TerminalManager:
                     terminal_session._running = True
                     
                     # Update database to reflect actual status - only after confirming socket exists
-                    self.db.update_session(db_session.id, status="active")
+                    await self.db.update_session(db_session.id, status="active")
                     
                     # Add to active sessions
                     self.sessions[session_uuid] = terminal_session
@@ -266,7 +266,7 @@ class TerminalManager:
                 else:
                     logger.warning(f"[TerminalManager] Screen session {session_uuid} socket not accessible")
                     # Update database to reflect actual status
-                    self.db.update_session(db_session.id, status="inactive")
+                    await self.db.update_session(db_session.id, status="inactive")
                     return None
                     
             else:
@@ -277,7 +277,7 @@ class TerminalManager:
             logger.error(f"[TerminalManager] Error restoring session {session_uuid}: {e}")
             # Update database to reflect actual status
             if db_session:
-                self.db.update_session(db_session.id, status="inactive")
+                await self.db.update_session(db_session.id, status="inactive")
             return None
 
     @log_function(Logger.DEBUG)
@@ -294,7 +294,7 @@ class TerminalManager:
         uuid_str = str(uuid_mod.uuid4())
         session_name = name or f"Terminal {len(self.sessions) + 1}"
 
-        session_id = self.db.create_session(
+        session_id = await self.db.create_session(
             uuid=uuid_str, name=session_name, profile_name=profile_name
         )
 
@@ -309,7 +309,7 @@ class TerminalManager:
             self.sessions[uuid_str] = session
             return session
         else:
-            self.db.delete_session(session_id)
+            await self.db.delete_session(session_id)
             return None
 
     def get_session(self, uuid: str) -> Optional[TerminalSession]:
@@ -321,7 +321,7 @@ class TerminalManager:
         if uuid in self.sessions:
             session = self.sessions[uuid]
             await session.stop()
-            self.db.update_session(
+            await self.db.update_session(
                 session.session_id,
                 status="inactive",
                 ended_at=datetime.now().isoformat(),

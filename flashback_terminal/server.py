@@ -3,14 +3,16 @@
 import asyncio
 import os
 import threading
+import traceback
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, status
+from fastapi.responses import HTMLResponse,  JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+
 
 from flashback_terminal.api.websocket import TerminalWebSocketHandler
 from flashback_terminal.config import get_config
@@ -41,6 +43,8 @@ class SearchRequest(BaseModel):
     filter_inactive: bool = False
 
 
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
@@ -59,6 +63,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Initializing database...")
     db = Database(config.db_path)
+    await db.init_db()
     logger.info(f"Database initialized: {config.db_path}")
 
     logger.info("Initializing terminal manager...")
@@ -144,10 +149,10 @@ async def retention_scheduler():
     while True:
         await asyncio.sleep(interval)
         if retention_manager:
-            retention_manager.run_cleanup()
+            await retention_manager.run_cleanup()
 
 
-app = FastAPI(title="flashback-terminal", lifespan=lifespan)
+app = FastAPI(title="flashback-terminal", lifespan=lifespan,debug=logger.get_verbosity() >= Logger.DEBUG)
 
 # Static files and templates
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -158,6 +163,27 @@ if os.path.exists(static_dir):
 
 templates = Jinja2Templates(directory=templates_dir if os.path.exists(templates_dir) else static_dir)
 
+
+@app.exception_handler(Exception)
+async def debug_exception_handler(request: Request, exc: Exception):
+    traceback_str = traceback.format_exc()
+    # Log it too
+    logger.debug('[FastAPI Internal Exception] Traceback:\n'+traceback_str)
+
+    if logger.get_verbosity() >= Logger.DEBUG:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "detail": "Internal Server Error",
+                "error": str(exc),
+                "traceback": traceback_str.split("\n")  # or send as string
+            },
+        )
+    else:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal Server Error"},
+        )
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -224,7 +250,7 @@ async def attach_to_session(session_uuid: str):
         raise HTTPException(status_code=409, detail="Session is already running")
     
     # Get session from database
-    session = db.get_session_by_uuid(session_uuid)
+    session = await db.get_session_by_uuid(session_uuid)
     if not session:
         logger.error(f"Session {session_uuid} not found in database")
         raise HTTPException(status_code=404, detail="Session not found")
@@ -281,7 +307,7 @@ async def list_sessions(
     """List terminal sessions."""
     logger.debug(f"list_sessions called: status={status}, limit={limit}, offset={offset}")
 
-    sessions = db.list_sessions(status=status, limit=limit, offset=offset)
+    sessions = await db.list_sessions(status=status, limit=limit, offset=offset)
     
     # Check which sessions are currently running in terminal manager
     # TODO: attach to previous running sessions in db?
@@ -332,7 +358,7 @@ async def create_session(profile: str = "default", name: Optional[str] = None):
 @app.get("/api/sessions/{session_uuid}")
 async def get_session(session_uuid: str):
     """Get session details."""
-    session = db.get_session_by_uuid(session_uuid)
+    session = await db.get_session_by_uuid(session_uuid)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -350,23 +376,23 @@ async def get_session(session_uuid: str):
 @app.put("/api/sessions/{session_uuid}")
 async def update_session(session_uuid: str, name: str):
     """Update session (rename)."""
-    session = db.get_session_by_uuid(session_uuid)
+    session = await db.get_session_by_uuid(session_uuid)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    db.update_session(session.id, name=name)
+    await db.update_session(session.id, name=name)
     return {"success": True}
 
 
 @app.delete("/api/sessions/{session_uuid}")
 async def delete_session(session_uuid: str):
     """Delete a session."""
-    session = db.get_session_by_uuid(session_uuid)
+    session = await db.get_session_by_uuid(session_uuid)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     await terminal_manager.close_session(session_uuid)
-    db.delete_session(session.id)
+    await db.delete_session(session.id)
     return {"success": True}
 
 
@@ -398,7 +424,7 @@ async def search(request: SearchRequest):
     if request.scope == "current" and request.session_ids:
         target_session_ids = []
         for uuid in request.session_ids:
-            session = db.get_session_by_uuid(uuid)
+            session = await db.get_session_by_uuid(uuid)
             if session:
                 target_session_ids.append(session.id)
         logger.debug(f"Search limited to session_ids: {target_session_ids}")
@@ -427,11 +453,11 @@ async def get_history(
     to_seq: Optional[int] = None,
 ):
     """Get terminal history for a session."""
-    session = db.get_session_by_uuid(session_uuid)
+    session = await db.get_session_by_uuid(session_uuid)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    outputs = db.get_terminal_output(session.id, from_seq, to_seq)
+    outputs = await db.get_terminal_output(session.id, from_seq, to_seq)
     return {
         "session_uuid": session_uuid,
         "outputs": [
@@ -449,11 +475,11 @@ async def get_history(
 @app.get("/api/screenshots/{session_uuid}")
 async def list_screenshots(session_uuid: str, limit: int = 100):
     """List screenshots for a session."""
-    session = db.get_session_by_uuid(session_uuid)
+    session = await db.get_session_by_uuid(session_uuid)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    screenshots = db.get_screenshots(session.id, limit)
+    screenshots = await db.get_screenshots(session.id, limit)
     return {
         "session_uuid": session_uuid,
         "screenshots": [
@@ -490,18 +516,18 @@ async def get_captures_timeline(
     """Get terminal captures for timeline view."""
     logger.debug(f"Timeline request: before={before_time}, around={around_time}, limit={limit}")
 
-    captures = db.get_terminal_captures_timeline(
+    captures = await db.get_terminal_captures_timeline(
         before_time=before_time,
         around_time=around_time,
         limit=limit,
     )
 
     # Get total count
-    with db._connect() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM terminal_captures").fetchone()[0]
-        oldest = conn.execute(
+    async with db._connect() as conn:
+        total = await((await conn.execute("SELECT COUNT(*) FROM terminal_captures")).fetchone())[0]
+        oldest = (await (await conn.execute(
             "SELECT MIN(strftime('%s', timestamp)) FROM terminal_captures"
-        ).fetchone()[0]
+        )).fetchone())[0]
 
     # Format results
     formatted = []
@@ -529,7 +555,7 @@ async def get_captures_timeline(
 @app.get("/api/v1/captures/by-id/{capture_id}")
 async def get_capture_detail(capture_id: int):
     """Get detailed information about a single capture."""
-    capture = db.get_terminal_capture_by_id(capture_id)
+    capture = await db.get_terminal_capture_by_id(capture_id)
     if not capture:
         raise HTTPException(status_code=404, detail="Capture not found")
 
@@ -555,7 +581,7 @@ async def get_capture_neighbors(
     after: int = Query(5, ge=0, le=20),
 ):
     """Get neighboring captures for timeline context."""
-    neighbors = db.get_terminal_capture_neighbors(capture_id, before=before, after=after)
+    neighbors = await db.get_terminal_capture_neighbors(capture_id, before=before, after=after)
 
     formatted = []
     for n in neighbors:
@@ -594,7 +620,7 @@ async def get_capture_screenshot(capture_id: int):
     """Serve a capture screenshot."""
     from fastapi.responses import FileResponse
 
-    capture = db.get_terminal_capture_by_id(capture_id)
+    capture = await db.get_terminal_capture_by_id(capture_id)
     if not capture or not capture.get("screenshot_path"):
         raise HTTPException(status_code=404, detail="Screenshot not found")
 

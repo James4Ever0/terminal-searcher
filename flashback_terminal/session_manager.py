@@ -25,7 +25,7 @@ import json
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 from flashback_terminal.config import get_config
 from flashback_terminal.database import Database
@@ -110,7 +110,7 @@ class BaseSession(ABC):
         session_id: str,
         name: str,
         profile: Dict[str, Any],
-        on_output: Optional[Callable[[str], None]] = None,
+        on_output: Optional[Callable[[str], Coroutine]] = None,
         on_clear: Optional[Callable[[], None]] = None,
         on_cursor: Optional[Callable[[int, int], None]] = None,
         init_commands:list[str] = []
@@ -206,12 +206,12 @@ class BaseSession(ABC):
         logger.trace('[BaseSession] is_running cache_used=%s, cache_found=%s, called_time=%s, result=%s, cache_reset=%s' % (cached,cache_found, time.time(), ret, cache_reset))
         return ret
 
-    def _log_output(self, content: str) -> None:
+    async def _log_output(self, content: str) -> None:
         """Log output for history keeper."""
         self._sequence_num += 1
         logger.debug(f"[{self.__class__.__name__}] Logging output (seq={self._sequence_num}, len={len(content)}): {content[:50]}...")
         if self.on_output:
-            self.on_output(content)
+            await self.on_output(content)
 
 
 class TmuxSession(BaseSession):
@@ -223,7 +223,7 @@ class TmuxSession(BaseSession):
         name: str,
         profile: Dict[str, Any],
         socket_dir: str,
-        on_output: Optional[Callable[[str], None]] = None,
+        on_output: Optional[Callable[[str], Coroutine]] = None,
         on_clear: Optional[Callable[[], None]] = None,
         on_cursor: Optional[Callable[[int, int], None]] = None,
         init_commands:list[str] = [],
@@ -509,7 +509,7 @@ set -g default-terminal "screen-256color"
     async def read(self, timeout: float = 0.1) -> Optional[str]:
         """Read from tmux session (via pty or capture-pane)."""
         if not self._running:
-            logger.debug(f"[TmuxSession] Session not running, cannot read")
+            logger.debug(f"[TmuxSession] Session {self._socket_name} not running, cannot read")
             return None
 
         # # Try pty first if available
@@ -527,7 +527,7 @@ set -g default-terminal "screen-256color"
                 if data:
                     logger.debug(f"[TmuxSession] Read {len(data)} bytes from pty")
                     text = data.decode("utf-8", errors="replace")
-                    self._log_output(text)
+                    await self._log_output(text)
                     self._read_mode = "pty"
                     return text
                 else:
@@ -561,10 +561,10 @@ set -g default-terminal "screen-256color"
                     if text.startswith(self._last_output):
                         new_content = text[len(self._last_output):]
                         if new_content.strip():  # Only log if there's actual new content
-                            self._log_output(new_content)
+                            await self._log_output(new_content)
                     else:
                         # Content changed significantly, log everything
-                        self._log_output(text)
+                        await self._log_output(text)
                 col, row = self._get_cursor()
                 self.on_cursor(col, row)
                 self._read_mode = "capture_pane"
@@ -740,7 +740,7 @@ class ScreenSession(BaseSession):
         name: str,
         profile: Dict[str, Any],
         socket_dir: str,
-        on_output: Optional[Callable[[str], None]] = None,
+        on_output: Optional[Callable[[str], Coroutine]] = None,
         init_commands: list[str] = [],
     ):
         super().__init__(session_id, name, profile, on_output, init_commands=init_commands)
@@ -1028,7 +1028,7 @@ unsetenv STY
                     data = await loop.run_in_executor(None, os.read, self._pty_fd, 4096)
                     if data:
                         text = data.decode("utf-8", errors="replace")
-                        self._log_output(text)
+                        await self._log_output(text)
                         return text
                 return None
             except (OSError, BlockingIOError) as e:

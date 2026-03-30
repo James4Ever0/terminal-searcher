@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -128,7 +129,7 @@ class CaptureWorker:
                 return None
 
             # Get database session record
-            db_session = self.db.get_session_by_uuid(session_id)
+            db_session = await self.db.get_session_by_uuid(session_id)
             if not db_session:
                 logger.warning(f"[CaptureWorker] Session {session_id} not found in database")
                 return None
@@ -148,7 +149,7 @@ class CaptureWorker:
             text_content = capture.text
 
             # Store in database
-            capture_id = self.db.insert_terminal_capture(
+            capture_id = await self.db.insert_terminal_capture(
                 session_id=db_session.id,
                 screenshot_path=screenshot_path,
                 text_content=text_content,
@@ -171,6 +172,7 @@ class CaptureWorker:
             }
 
         except Exception as e:
+            logger.error("[CaptureWorker] Error traceback:\n"+traceback.format_exc())
             logger.error(f"[CaptureWorker] Failed to capture session {session_id}: {e}")
             return None
 

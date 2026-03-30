@@ -36,9 +36,9 @@ class BM25Search:
             return list(jieba.lcut_for_search(text.lower()))
         return re.findall(r"\b\w+\b", text.lower())
 
-    def _build_index(self) -> None:
-        with self.db._connect() as conn:
-            rows = conn.execute("SELECT id, session_id, text_content FROM terminal_captures WHERE text_content IS NOT NULL").fetchall()
+    async def _build_index(self) -> None:
+        async with self.db._connect() as conn:
+            rows = await (await conn.execute("SELECT id, session_id, text_content FROM terminal_captures WHERE text_content IS NOT NULL")).fetchall()
         
         logger.debug(f"[BM25Search] Building index from {len(rows)} terminal output records")
 
@@ -137,7 +137,7 @@ class EmbeddingSearch:
         data = response.json()
         return data["data"][0]["embedding"]
 
-    def search(
+    async def search(
         self, query: str, session_ids: Optional[List[int]] = None, top_k: int = 50
     ) -> List[Tuple[int, float]]:
         import numpy as np
@@ -157,7 +157,7 @@ class EmbeddingSearch:
                 similarity = np.dot(query_vec, emb) / (query_norm * np.linalg.norm(emb))
 
                 session_uuid = emb_file.stem
-                session = self.db.get_session_by_uuid(session_uuid)
+                session = await self.db.get_session_by_uuid(session_uuid)
                 if session:
                     if session_ids and session.id not in session_ids:
                         continue
@@ -212,25 +212,25 @@ class SearchEngine:
         if mode == "text":
             if not self.bm25:
                 return []
+            await self.bm25._build_index()
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.bm25._build_index)
-            results = self.bm25.search(query, session_ids, limit)
+            results = await loop.run_in_executor(None, self.bm25.search, query, session_ids, limit)
 
         elif mode == "semantic":
             if not self.embedding:
                 return []
-            results = self.embedding.search(query, session_ids, limit)
+            results = await self.embedding.search(query, session_ids, limit)
 
         elif mode == "hybrid":
             bm25_results = []
             embedding_results = []
 
             if self.bm25:
+                await self.bm25._build_index()
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self.bm25._build_index)
-                bm25_results = self.bm25.search(query, session_ids, limit * 2)
+                bm25_results = await loop.run_in_executor(None, self.bm25.search, query, session_ids, limit * 2)
             if self.embedding:
-                embedding_results = self.embedding.search(query, session_ids, limit * 2)
+                embedding_results = await self.embedding.search(query, session_ids, limit * 2)
 
             rrf_k = self.config.get("modules.semantic_search.rrf_k", 60)
             results = reciprocal_rank_fusion(bm25_results, embedding_results, k=rrf_k, top_k=limit)
@@ -240,9 +240,9 @@ class SearchEngine:
 
         enriched = []
         for doc_id, score in results:
-            capture = self.db.get_terminal_capture_by_id(doc_id)
+            capture = await self.db.get_terminal_capture_by_id(doc_id)
             if capture:
-                session = self.db.get_session(capture["session_id"])
+                session = await self.db.get_session(capture["session_id"])
                 
                 # Apply time range filter if specified
                 if time_range:

@@ -20,7 +20,7 @@ class RetentionManager:
         self.db = db
         self.config = get_config()
 
-    def run_cleanup(self) -> None:
+    async def run_cleanup(self) -> None:
         """Run the retention cleanup process."""
         retention_days = self.config.retention_days
         strategy = self.config.get("workers.retention.strategy", "archive")
@@ -29,7 +29,7 @@ class RetentionManager:
             f"[RetentionManager] Running cleanup (strategy: {strategy}, days: {retention_days})"
         )
 
-        old_sessions = self.db.get_sessions_older_than(retention_days)
+        old_sessions = await self.db.get_sessions_older_than(retention_days)
 
         if not old_sessions:
             print("[RetentionManager] No old sessions to process")
@@ -38,24 +38,24 @@ class RetentionManager:
         print(f"[RetentionManager] Found {len(old_sessions)} sessions to process")
 
         if strategy == "delete":
-            self._delete_sessions(old_sessions)
+            await self._delete_sessions(old_sessions)
         else:
-            self._archive_sessions(old_sessions)
+            await self._archive_sessions(old_sessions)
 
         if strategy == "archive":
-            self._enforce_archive_constraints()
+            await self._enforce_archive_constraints()
 
-    def _delete_sessions(self, session_ids: List[int]) -> None:
+    async def _delete_sessions(self, session_ids: List[int]) -> None:
         """Permanently delete sessions."""
         for session_id in session_ids:
-            self._delete_session_data(session_id)
-            self.db.delete_session(session_id)
+            await self._delete_session_data(session_id)
+            await self.db.delete_session(session_id)
             print(f"[RetentionManager] Deleted session {session_id}")
 
-    def _delete_session_data(self, session_id: int) -> None:
+    async def _delete_session_data(self, session_id: int) -> None:
         """Delete all data associated with a session."""
         config = self.config
-        session = self.db.get_session(session_id)
+        session = await self.db.get_session(session_id)
         if not session:
             return
 
@@ -71,7 +71,7 @@ class RetentionManager:
         if embedding_file.exists():
             embedding_file.unlink()
 
-    def _archive_sessions(self, session_ids: List[int]) -> None:
+    async def _archive_sessions(self, session_ids: List[int]) -> None:
         """Archive sessions to compressed storage."""
         if not session_ids:
             return
@@ -97,11 +97,11 @@ class RetentionManager:
             date_to: Optional[datetime] = None
 
             for session_id in session_ids:
-                session = self.db.get_session(session_id)
+                session = await self.db.get_session(session_id)
                 if not session:
                     continue
 
-                session_data = self._archive_session(session, work_dir)
+                session_data = await self._archive_session(session, work_dir)
                 if session_data:
                     sessions_data.append(session_data)
                     output_count += session_data.get("output_count", 0)
@@ -154,8 +154,8 @@ class RetentionManager:
 
             archive_size = final_path.stat().st_size
 
-            with self.db._connect() as conn:
-                conn.execute(
+            async with self.db._connect() as conn:
+                await conn.execute(
                     """
                     INSERT INTO archive_manifest
                     (archive_path, session_count, output_count, screenshot_count,
@@ -177,7 +177,7 @@ class RetentionManager:
 
             for session_id in session_ids:
                 self._delete_session_data(session_id)
-                self.db.update_session(session_id, status="archived")
+                await self.db.update_session(session_id, status="archived")
 
             shutil.rmtree(work_dir)
 
@@ -189,7 +189,7 @@ class RetentionManager:
             print(f"[RetentionManager] Archive failed: {e}")
             raise
 
-    def _archive_session(self, session, work_dir: Path) -> Optional[Dict]:
+    async def _archive_session(self, session, work_dir: Path) -> Optional[Dict]:
         """Archive a single session's data."""
         config = self.config
         session_dir = work_dir / "sessions" / session.uuid
@@ -208,7 +208,7 @@ class RetentionManager:
         with open(session_dir / "metadata.json", "w", encoding="utf-8") as f:
             json.dump(session_data, f, indent=2)
 
-        outputs = self.db.get_terminal_output(session.id)
+        outputs = await self.db.get_terminal_output(session.id)
         output_count = len(outputs)
 
         with open(session_dir / "output.jsonl", "w", encoding="utf-8") as f:
@@ -256,7 +256,7 @@ class RetentionManager:
                 checksums[str(rel_path)] = sha256.hexdigest()
         return checksums
 
-    def _enforce_archive_constraints(self) -> None:
+    async def _enforce_archive_constraints(self) -> None:
         """Enforce archive size and age constraints."""
         config = self.config
         max_size = config.get("workers.retention.archive.total_size_limit", 0)
@@ -267,10 +267,10 @@ class RetentionManager:
 
         archive_dir = Path(config.archive_dir)
 
-        with self.db._connect() as conn:
-            rows = conn.execute(
+        async with self.db._connect() as conn:
+            rows = await (await conn.execute(
                 "SELECT * FROM archive_manifest ORDER BY created_at ASC"
-            ).fetchall()
+            )).fetchall()
 
         total_size = sum(row["size_bytes"] for row in rows)
         now = datetime.now()
@@ -294,13 +294,13 @@ class RetentionManager:
                     archive_path.unlink()
                 total_size -= row["size_bytes"]
 
-                with self.db._connect() as conn:
-                    conn.execute(
+                async with self.db._connect() as conn:
+                    await conn.execute(
                         "DELETE FROM archive_manifest WHERE id = ?", (row["id"],)
                     )
-                    conn.commit()
+                    await conn.commit()
 
-    def restore_session(self, archive_path: Path, uuid: str) -> bool:
+    async def restore_session(self, archive_path: Path, uuid: str) -> bool:
         """Restore a session from archive."""
         if not archive_path.exists():
             return False
@@ -326,14 +326,14 @@ class RetentionManager:
             with open(session_dir / "metadata.json", encoding="utf-8") as f:
                 metadata = json.load(f)
 
-            session_id = self.db.create_session(
+            session_id = await self.db.create_session(
                 uuid=metadata["uuid"],
                 name=metadata["name"],
                 profile_name=metadata["profile_name"],
                 metadata=metadata.get("metadata", {}),
             )
 
-            self.db.update_session(
+            await self.db.update_session(
                 session_id, last_cwd=metadata.get("last_cwd"), status="inactive"
             )
 
@@ -342,7 +342,7 @@ class RetentionManager:
                 with open(output_file, encoding="utf-8") as f:
                     for line in f:
                         record = json.loads(line)
-                        self.db.insert_terminal_output(
+                        await self.db.insert_terminal_output(
                             session_id=session_id,
                             sequence_num=record["sequence_num"],
                             content=record["content"],

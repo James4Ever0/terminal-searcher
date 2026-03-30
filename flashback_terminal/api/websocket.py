@@ -32,7 +32,7 @@ class TerminalWebSocketHandler:
         session = self.terminal_manager.get_session(session_uuid)
         was_restored = False
         if not session:
-            db_session = self.db.get_session_by_uuid(session_uuid)
+            db_session = await self.db.get_session_by_uuid(session_uuid)
             if db_session:
                 # Try to restore/reattach to the session
                 logger.info(f"[WebSocket] Attempting to restore session {session_uuid}")
@@ -96,7 +96,7 @@ class TerminalWebSocketHandler:
             {
                 "type": "session_info",
                 "uuid": session_uuid,
-                "name": self.db.get_session(session.session_id).name if session.session_id else "Terminal",
+                "name": (await self.db.get_session(session.session_id)).name if session.session_id else "Terminal",
                 "restored": was_restored,  # Indicates if this was a restored session
             }
         )
@@ -194,9 +194,7 @@ class TerminalWebSocketHandler:
             elif msg_type == "command":
                 cmd = msg.get("cmd")
                 if cmd == "rename":
-                    session.db.update_session(
-                        session.session_id, name=msg.get("name", "Unnamed")
-                    )
+                    await session.db.update_session(session.session_id, name=msg.get("name", "Unnamed"))
                 elif cmd == "set_title":
                     title = msg.get("title", "")
                     if title:
@@ -261,7 +259,7 @@ class TerminalWebSocketHandler:
 
             img.save(filepath, "PNG")
 
-            session.db.insert_screenshot(
+            await session.db.insert_screenshot(
                 session_id=session.session_id,
                 file_path=str(filepath),
                 file_size=len(img_bytes),
@@ -277,7 +275,7 @@ class TerminalWebSocketHandler:
         config = get_config()
         max_age = config.get("modules.session_recovery.max_recovery_age_days", 30)
 
-        session = self.db.get_session(session_id)
+        session = await self.db.get_session(session_id)
         if not session:
             return
 
@@ -287,7 +285,7 @@ class TerminalWebSocketHandler:
         if age_days > max_age:
             return
 
-        outputs = self.db.get_terminal_output(session_id)
+        outputs = await self.db.get_terminal_output(session_id)
         if not outputs:
             return
 
@@ -319,7 +317,7 @@ class TerminalWebSocketHandler:
         if not config.is_module_enabled("session_recovery"):
             return
 
-        db_session = session.db.get_session(session.session_id)
+        db_session = await session.db.get_session(session.session_id)
         last_cwd = db_session.last_cwd if db_session else None
 
         if not last_cwd:

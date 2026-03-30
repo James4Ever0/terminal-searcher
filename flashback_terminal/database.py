@@ -1,8 +1,8 @@
 """Database models and operations for flashback-terminal."""
 
 import json
-import sqlite3
-from contextlib import contextmanager
+import aiosqlite
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -68,20 +68,19 @@ class Database:
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self.init_db()
 
-    @contextmanager
-    def _connect(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+    @asynccontextmanager
+    async def _connect(self):
+        conn = await aiosqlite.connect(self.db_path)
+        conn.row_factory = aiosqlite.Row
         try:
             yield conn
         finally:
-            conn.close()
+            await conn.close()
 
-    def init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute("""
+    async def init_db(self) -> None:
+        async with self._connect() as conn:
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     uuid TEXT UNIQUE NOT NULL,
@@ -101,7 +100,7 @@ class Database:
                 )
             """)
 
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS terminal_output (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -112,7 +111,7 @@ class Database:
                 )
             """)
 
-            conn.execute("""
+            await conn.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS terminal_output_fts USING fts5(
                     content,
                     content_rowid=rowid,
@@ -120,7 +119,7 @@ class Database:
                 )
             """)
 
-            conn.execute("""
+            await conn.execute("""
                 CREATE TRIGGER IF NOT EXISTS terminal_output_ai
                 AFTER INSERT ON terminal_output
                 BEGIN
@@ -128,7 +127,7 @@ class Database:
                 END
             """)
 
-            conn.execute("""
+            await conn.execute("""
                 CREATE TRIGGER IF NOT EXISTS terminal_output_ad
                 AFTER DELETE ON terminal_output
                 BEGIN
@@ -137,7 +136,7 @@ class Database:
                 END
             """)
 
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS screenshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -149,7 +148,7 @@ class Database:
                 )
             """)
 
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS terminal_captures (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -162,7 +161,7 @@ class Database:
                 )
             """)
 
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS embeddings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -173,7 +172,7 @@ class Database:
                 )
             """)
 
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS archive_manifest (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     archive_path TEXT NOT NULL,
@@ -188,18 +187,18 @@ class Database:
                 )
             """)
 
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_output_session ON terminal_output(session_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_output_sequence ON terminal_output(session_id, sequence_num)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_screenshots_session ON screenshots(session_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_captures_session ON terminal_captures(session_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_captures_timestamp ON terminal_captures(timestamp)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_output_session ON terminal_output(session_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_output_sequence ON terminal_output(session_id, sequence_num)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_screenshots_session ON screenshots(session_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_captures_session ON terminal_captures(session_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_captures_timestamp ON terminal_captures(timestamp)")
 
-            conn.commit()
+            await conn.commit()
 
     @log_function(Logger.DEBUG)
-    def create_session(
+    async def create_session(
         self,
         uuid: str,
         name: str,
@@ -211,34 +210,34 @@ class Database:
         window_id: Optional[str] = None,
     ) -> int:
         logger.debug(f"Creating session: uuid={uuid}, name={name}, profile={profile_name}, type={session_type}")
-        with self._connect() as conn:
-            cursor = conn.execute(
+        async with self._connect() as conn:
+            cursor = await conn.execute(
                 """INSERT INTO sessions
                     (uuid, name, profile_name, metadata, session_type, socket_path, pane_id, window_id)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (uuid, name, profile_name, json.dumps(metadata or {}),
                  session_type, socket_path, pane_id, window_id),
             )
-            conn.commit()
+            await conn.commit()
             session_id = cursor.lastrowid
             logger.info(f"Session created: id={session_id}, uuid={uuid}, type={session_type}")
             return session_id
 
-    def get_session(self, session_id: int) -> Optional[Session]:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    async def get_session(self, session_id: int) -> Optional[Session]:
+        async with self._connect() as conn:
+            row = await (await conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))).fetchone()
             if row:
                 return self._row_to_session(row)
             return None
 
-    def get_session_by_uuid(self, uuid: str) -> Optional[Session]:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM sessions WHERE uuid = ?", (uuid,)).fetchone()
+    async def get_session_by_uuid(self, uuid: str) -> Optional[Session]:
+        async with self._connect() as conn:
+            row = await (await conn.execute("SELECT * FROM sessions WHERE uuid = ?", (uuid,))).fetchone()
             if row:
                 return self._row_to_session(row)
             return None
 
-    def update_session(self, session_id: int, **kwargs) -> None:
+    async def update_session(self, session_id: int, **kwargs) -> None:
         allowed = {"name", "last_cwd", "status", "ended_at", "last_active_at", "metadata",
                    "session_type", "socket_path", "pane_id", "window_id"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
@@ -248,69 +247,69 @@ class Database:
         set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
         values = list(updates.values()) + [session_id]
 
-        with self._connect() as conn:
-            conn.execute(f"UPDATE sessions SET {set_clause} WHERE id = ?", values)
-            conn.commit()
+        async with self._connect() as conn:
+            await conn.execute(f"UPDATE sessions SET {set_clause} WHERE id = ?", values)
+            await conn.commit()
 
-    def list_sessions(
+    async def list_sessions(
         self, status: Optional[str] = None, limit: int = 100, offset: int = 0
     ) -> List[Session]:
-        with self._connect() as conn:
+        async with self._connect() as conn:
             if status:
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     "SELECT * FROM sessions WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                     (status, limit, offset),
-                ).fetchall()
+                )).fetchall()
             else:
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     "SELECT * FROM sessions ORDER BY created_at DESC LIMIT ? OFFSET ?",
                     (limit, offset),
-                ).fetchall()
+                )).fetchall()
             return [self._row_to_session(row) for row in rows]
 
-    def insert_terminal_output(
+    async def insert_terminal_output(
         self, session_id: int, sequence_num: int, content: str, content_type: str = "output"
     ) -> int:
-        with self._connect() as conn:
-            cursor = conn.execute(
+        async with self._connect() as conn:
+            cursor = await conn.execute(
                 "INSERT INTO terminal_output (session_id, sequence_num, content, content_type) VALUES (?, ?, ?, ?)",
                 (session_id, sequence_num, content, content_type),
             )
-            conn.commit()
+            await conn.commit()
             return cursor.lastrowid
 
-    def get_terminal_output(
+    async def get_terminal_output(
         self, session_id: int, from_seq: Optional[int] = None, to_seq: Optional[int] = None
     ) -> List[TerminalOutput]:
-        with self._connect() as conn:
+        async with self._connect() as conn:
             if from_seq is not None and to_seq is not None:
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     """SELECT * FROM terminal_output
                        WHERE session_id = ? AND sequence_num BETWEEN ? AND ?
                        ORDER BY sequence_num""",
                     (session_id, from_seq, to_seq),
-                ).fetchall()
+                )).fetchall()
             else:
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     "SELECT * FROM terminal_output WHERE session_id = ? ORDER BY sequence_num",
                     (session_id,),
-                ).fetchall()
+                )).fetchall()
             return [self._row_to_terminal_output(row) for row in rows]
 
-    def get_terminal_output_by_id(self, output_id: int) -> Optional[TerminalOutput]:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM terminal_output WHERE id = ?", (output_id,)).fetchone()
+    async def get_terminal_output_by_id(self, output_id: int) -> Optional[TerminalOutput]:
+        async with self._connect() as conn:
+            row = await (await conn.execute("SELECT * FROM terminal_output WHERE id = ?", (output_id,))).fetchone()
             if row:
                 return self._row_to_terminal_output(row)
             return None
 
-    def search_text(
+    async def search_text(
         self, query: str, session_ids: Optional[List[int]] = None, limit: int = 50
     ) -> List[Dict]:
-        with self._connect() as conn:
+        async with self._connect() as conn:
             if session_ids:
                 placeholders = ",".join("?" * len(session_ids))
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     f"""
                     SELECT o.*, s.uuid as session_uuid, s.name as session_name
                     FROM terminal_output_fts fts
@@ -321,9 +320,9 @@ class Database:
                     LIMIT ?
                 """,
                     (query, *session_ids, limit),
-                ).fetchall()
+                )).fetchall()
             else:
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     """
                     SELECT o.*, s.uuid as session_uuid, s.name as session_name
                     FROM terminal_output_fts fts
@@ -334,41 +333,41 @@ class Database:
                     LIMIT ?
                 """,
                     (query, limit),
-                ).fetchall()
+                )).fetchall()
             return [dict(row) for row in rows]
 
-    def insert_screenshot(
+    async def insert_screenshot(
         self, session_id: int, file_path: str, file_size: int, width: int, height: int
     ) -> int:
-        with self._connect() as conn:
-            cursor = conn.execute(
+        async with self._connect() as conn:
+            cursor = await conn.execute(
                 "INSERT INTO screenshots (session_id, file_path, file_size, width, height) VALUES (?, ?, ?, ?, ?)",
                 (session_id, file_path, file_size, width, height),
             )
-            conn.commit()
+            await conn.commit()
             return cursor.lastrowid
 
-    def get_screenshots(self, session_id: int, limit: int = 100) -> List[Screenshot]:
-        with self._connect() as conn:
-            rows = conn.execute(
+    async def get_screenshots(self, session_id: int, limit: int = 100) -> List[Screenshot]:
+        async with self._connect() as conn:
+            rows = await (await conn.execute(
                 "SELECT * FROM screenshots WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
                 (session_id, limit),
-            ).fetchall()
+            )).fetchall()
             return [self._row_to_screenshot(row) for row in rows]
 
-    def get_sessions_older_than(self, days: int) -> List[int]:
+    async def get_sessions_older_than(self, days: int) -> List[int]:
         cutoff = datetime.now() - timedelta(days=days)
-        with self._connect() as conn:
-            rows = conn.execute(
+        async with self._connect() as conn:
+            rows = await (await conn.execute(
                 "SELECT id FROM sessions WHERE created_at < ? AND status != 'archived'",
                 (cutoff,),
-            ).fetchall()
+            )).fetchall()
             return [row[0] for row in rows]
 
-    def delete_session(self, session_id: int) -> None:
-        with self._connect() as conn:
-            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            conn.commit()
+    async def delete_session(self, session_id: int) -> None:
+        async with self._connect() as conn:
+            await conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            await conn.commit()
 
     def _row_to_session(self, row) -> Session:
         return Session(
@@ -410,7 +409,7 @@ class Database:
             height=row["height"],
         )
 
-    def insert_terminal_capture(
+    async def insert_terminal_capture(
         self,
         session_id: int,
         screenshot_path: Optional[str] = None,
@@ -420,42 +419,42 @@ class Database:
         metadata: Optional[Dict] = None,
     ) -> int:
         """Insert a terminal capture record (backend screenshot from screen/tmux)."""
-        with self._connect() as conn:
-            cursor = conn.execute(
+        async with self._connect() as conn:
+            cursor = await conn.execute(
                 """INSERT INTO terminal_captures
                     (session_id, screenshot_path, text_content, ansi_content, capture_type, metadata)
                     VALUES (?, ?, ?, ?, ?, ?)""",
                 (session_id, screenshot_path, text_content, ansi_content,
                  capture_type, json.dumps(metadata or {})),
             )
-            conn.commit()
+            await conn.commit()
             return cursor.lastrowid
 
-    def get_terminal_captures(
+    async def get_terminal_captures(
         self, session_id: int, limit: int = 100, offset: int = 0
     ) -> List[TerminalCapture]:
         """Get terminal captures for a session."""
-        with self._connect() as conn:
-            rows = conn.execute(
+        async with self._connect() as conn:
+            rows = await (await conn.execute(
                 """SELECT * FROM terminal_captures
                    WHERE session_id = ?
                    ORDER BY timestamp DESC
                    LIMIT ? OFFSET ?""",
                 (session_id, limit, offset),
-            ).fetchall()
+            )).fetchall()
             return [self._row_to_capture(row) for row in rows]
 
-    def get_terminal_captures_timeline(
+    async def get_terminal_captures_timeline(
         self,
         before_time: Optional[float] = None,
         around_time: Optional[float] = None,
         limit: int = 50,
     ) -> List[Dict]:
         """Get terminal captures for timeline view."""
-        with self._connect() as conn:
+        async with self._connect() as conn:
             if around_time:
                 # Get captures around a specific time
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
                        FROM terminal_captures tc
                        JOIN sessions s ON tc.session_id = s.id
@@ -463,10 +462,10 @@ class Database:
                        ORDER BY tc.timestamp DESC
                        LIMIT ?""",
                     (around_time, limit),
-                ).fetchall()
+                )).fetchall()
             elif before_time:
                 # Get captures before a specific time
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
                        FROM terminal_captures tc
                        JOIN sessions s ON tc.session_id = s.id
@@ -474,50 +473,50 @@ class Database:
                        ORDER BY tc.timestamp DESC
                        LIMIT ?""",
                     (before_time, limit),
-                ).fetchall()
+                )).fetchall()
             else:
                 # Get most recent captures
-                rows = conn.execute(
+                rows = await (await conn.execute(
                     """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
                        FROM terminal_captures tc
                        JOIN sessions s ON tc.session_id = s.id
                        ORDER BY tc.timestamp DESC
                        LIMIT ?""",
                     (limit,),
-                ).fetchall()
+                )).fetchall()
             return [dict(row) for row in rows]
 
-    def get_terminal_capture_by_id(self, capture_id: int) -> Optional[Dict]:
+    async def get_terminal_capture_by_id(self, capture_id: int) -> Optional[Dict]:
         """Get a single terminal capture with session info."""
-        with self._connect() as conn:
-            row = conn.execute(
+        async with self._connect() as conn:
+            row = await (await conn.execute(
                 """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
                    FROM terminal_captures tc
                    JOIN sessions s ON tc.session_id = s.id
                    WHERE tc.id = ?""",
                 (capture_id,),
-            ).fetchone()
+            )).fetchone()
             if row:
                 return dict(row)
             return None
 
-    def get_terminal_capture_neighbors(
+    async def get_terminal_capture_neighbors(
         self, capture_id: int, before: int = 5, after: int = 5
     ) -> List[Dict]:
         """Get neighboring captures for timeline context."""
-        with self._connect() as conn:
+        async with self._connect() as conn:
             # First get the timestamp of the reference capture
-            ref = conn.execute(
+            ref = await (await conn.execute(
                 "SELECT timestamp FROM terminal_captures WHERE id = ?",
                 (capture_id,),
-            ).fetchone()
+            )).fetchone()
             if not ref:
                 return []
 
             ref_time = ref["timestamp"]
 
             # Get captures before
-            before_rows = conn.execute(
+            before_rows = await (await conn.execute(
                 """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
                    FROM terminal_captures tc
                    JOIN sessions s ON tc.session_id = s.id
@@ -525,10 +524,10 @@ class Database:
                    ORDER BY tc.timestamp DESC
                    LIMIT ?""",
                 (ref_time, before),
-            ).fetchall()
+            )).fetchall()
 
             # Get captures after
-            after_rows = conn.execute(
+            after_rows = await (await conn.execute(
                 """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
                    FROM terminal_captures tc
                    JOIN sessions s ON tc.session_id = s.id
@@ -536,7 +535,7 @@ class Database:
                    ORDER BY tc.timestamp ASC
                    LIMIT ?""",
                 (ref_time, after),
-            ).fetchall()
+            )).fetchall()
 
             # Combine and mark center
             results = []
@@ -545,13 +544,13 @@ class Database:
                 d["is_center"] = False
                 results.append(d)
 
-            center = conn.execute(
+            center = await (await conn.execute(
                 """SELECT tc.*, s.uuid as session_uuid, s.name as session_name
                    FROM terminal_captures tc
                    JOIN sessions s ON tc.session_id = s.id
                    WHERE tc.id = ?""",
                 (capture_id,),
-            ).fetchone()
+            )).fetchone()
             if center:
                 c = dict(center)
                 c["is_center"] = True
