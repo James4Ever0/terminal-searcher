@@ -136,7 +136,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "search": {
         "enabled_methods": {"bm25": True, "embedding": False, "regex": True},
-        "bm25": {"k1": 1.5, "b": 0.75, "default_limit": 50},
+        "bm25": {"k1": 1.5, "b": 0.75, "default_limit": 50, "rebuild_interval_seconds": 10},
         "embedding": {"default_limit": 50},
         "context_lines": 3,
     },
@@ -209,9 +209,10 @@ class Config:
         self.screenshot_dir = data_dir / "screenshots"
         self.embedding_dir = data_dir / "embeddings"
         self.archive_dir = data_dir / "archive"
+        self.search_index_dir = data_dir / "search_indices"
         self.db_path = data_dir / "terminal.db"
 
-        for d in [self.log_dir, self.screenshot_dir, self.embedding_dir, self.archive_dir]:
+        for d in [self.log_dir, self.screenshot_dir, self.embedding_dir, self.archive_dir, self.search_index_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
     def get(self, key: str, default: Any = None) -> Any:

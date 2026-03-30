@@ -1,5 +1,6 @@
 """Search functionality for flashback-terminal."""
 
+import asyncio
 import math
 import re
 from collections import defaultdict
@@ -7,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from flashback_terminal.logger import logger
-import asyncio
+from flashback_terminal.bm25_index import BM25SQLiteIndexAsync
 
 
 try:
@@ -22,78 +23,121 @@ from flashback_terminal.database import Database
 
 
 class BM25Search:
-    """BM25 text search over terminal output."""
+    """BM25 text search over terminal output using async SQLite index."""
 
     def __init__(self, db: Database):
         self.db = db
         self.config = get_config()
         self.k1 = self.config.get("search.bm25.k1", 1.5)
         self.b = self.config.get("search.bm25.b", 0.75)
-        # self._build_index()
+        self.rebuild_interval = self.config.get("search.bm25.rebuild_interval_seconds", 10)
+        
+        # Initialize BM25 index
+        index_path = Path(self.config.search_index_dir) / "bm25_index.db"
+        self.bm25_index = BM25SQLiteIndexAsync(
+            db_path=str(index_path),
+            tokenizer=self._tokenize,
+            k1=self.k1,
+            b=self.b
+        )
+        
+        # Background task for index rebuilding
+        self._rebuild_task = None
+        self._initialized = False
 
     def _tokenize(self, text: str) -> List[str]:
         if JIEBA_AVAILABLE:
             return list(jieba.lcut_for_search(text.lower()))
         return re.findall(r"\b\w+\b", text.lower())
-
+    
+    async def initialize(self) -> None:
+        """Initialize the BM25 index and start background rebuilding."""
+        if not self._initialized:
+            await self.bm25_index.initialize()
+            await self._build_index()
+            self._start_background_rebuild()
+            self._initialized = True
+    
     async def _build_index(self) -> None:
-        async with self.db._connect() as conn:
-            rows = await (await conn.execute("SELECT id, session_id, text_content FROM terminal_captures WHERE text_content IS NOT NULL")).fetchall()
+        """Build the BM25 index from terminal captures."""
+        logger.debug("[BM25Search] Building index from terminal captures")
         
-        logger.debug(f"[BM25Search] Building index from {len(rows)} terminal output records")
-
-        self.documents: Dict[int, Dict] = {}
-        self.doc_lengths: Dict[int, int] = {}
-        self.inverted_index: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
-        self.doc_freqs: Dict[str, int] = defaultdict(int)
-
-        total_length = 0
-
+        async with self.db._connect() as conn:
+            rows = await (await conn.execute(
+                "SELECT id, session_id, text_content FROM terminal_captures WHERE text_content IS NOT NULL"
+            )).fetchall()
+        
+        logger.debug(f"[BM25Search] Processing {len(rows)} terminal output records")
+        
+        # Clear existing index and rebuild
+        await self.bm25_index.clear_all()
+        
+        # Add documents to index
         for row in rows:
             doc_id = row["id"]
             content = row["text_content"]
-
-            tokens = self._tokenize(content)
-            self.documents[doc_id] = {"session_id": row["session_id"], "content": content}
-            self.doc_lengths[doc_id] = len(tokens)
-            total_length += len(tokens)
-
-            term_counts: Dict[str, int] = defaultdict(int)
-            for token in tokens:
-                term_counts[token] += 1
-
-            for term, freq in term_counts.items():
-                self.inverted_index[term].append((doc_id, freq))
-                self.doc_freqs[term] += 1
-
-        self.N = len(self.documents)
-        self.avg_dl = total_length / self.N if self.N > 0 else 0
-        logger.debug(f"[BM25Search] Index built: {self.N} documents, avg length={self.avg_dl:.2f}")
+            try:
+                await self.bm25_index.add_document(doc_id, content)
+            except Exception as e:
+                logger.warning(f"[BM25Search] Failed to add document {doc_id}: {e}")
+        
+        logger.debug(f"[BM25Search] Index rebuilt with {self.bm25_index.num_docs} documents")
 
     def search(
         self, query: str, session_ids: Optional[List[int]] = None, top_k: int = 50
     ) -> List[Tuple[int, float]]:
-        query_terms = self._tokenize(query)
-        scores: Dict[int, float] = defaultdict(float)
-
-        for term in query_terms:
-            if term not in self.inverted_index:
-                continue
-
-            df = self.doc_freqs[term]
-            idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1)
-
-            for doc_id, tf in self.inverted_index[term]:
-                if session_ids and self.documents[doc_id]["session_id"] not in session_ids:
-                    continue
-
-                dl = self.doc_lengths[doc_id]
-                denom = self.k1 * (1 - self.b + self.b * (dl / self.avg_dl)) + tf
-                score = idf * (tf * (self.k1 + 1)) / denom
-                scores[doc_id] += score
-
-        results = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        """Search using the BM25 index."""
+        if not self._initialized:
+            return []
+        
+        # Get raw results from BM25 index
+        raw_results = self.bm25_index.query(query, top_k * 2)  # Get more to filter
+        
+        # Convert doc_id strings to integers and filter by session if needed
+        results = []
+        for doc_id_str, score in raw_results:
+            try:
+                doc_id = int(doc_id_str)
+                # If session filtering is needed, we'd need to look up the session_id
+                # For now, we'll include all results and let the SearchEngine handle filtering
+                results.append((doc_id, score))
+            except ValueError:
+                continue  # Skip invalid doc_ids
+        
         return results[:top_k]
+    
+    def _start_background_rebuild(self) -> None:
+        """Start the background task to rebuild the index periodically."""
+        if self._rebuild_task is None or self._rebuild_task.done():
+            logger.debug("[BM25Search] Starting background rebuild task")
+            self._rebuild_task = asyncio.create_task(self._background_rebuild_loop())
+        else:
+            logger.debug("[BM25Search] Background rebuild task already running")
+    
+    async def _background_rebuild_loop(self) -> None:
+        """Background loop that rebuilds the index periodically."""
+        while True:
+            try:
+                logger.debug("[BM25Search] Waiting for rebuild interval...")
+                await asyncio.sleep(self.rebuild_interval)
+                logger.debug("[BM25Search] Building index...")
+                await self._build_index()
+            except asyncio.CancelledError:
+                logger.debug("[BM25Search] Background rebuild task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"[BM25Search] Background rebuild failed: {e}")
+    
+    async def close(self) -> None:
+        """Close the BM25 search and cleanup resources."""
+        if self._rebuild_task and not self._rebuild_task.done():
+            self._rebuild_task.cancel()
+            try:
+                await self._rebuild_task
+            except asyncio.CancelledError:
+                pass
+        
+        await self.bm25_index.close()
 
 
 class EmbeddingSearch:
@@ -197,6 +241,13 @@ class SearchEngine:
                 self.embedding = EmbeddingSearch(db)
             except Exception as e:
                 print(f"[SearchEngine] Embedding search not available: {e}")
+    
+    async def initialize(self) -> None:
+        """Initialize all search components."""
+        if self.bm25:
+            await self.bm25.initialize()
+        # Embedding search doesn't need initialization
+        logger.debug("[SearchEngine] Search components initialized")
 
     async def search(
         self,
@@ -212,9 +263,8 @@ class SearchEngine:
         if mode == "text":
             if not self.bm25:
                 return []
-            await self.bm25._build_index()
-            loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(None, self.bm25.search, query, session_ids, limit)
+            # Index is built automatically in background, just search
+            results = self.bm25.search(query, session_ids, limit)
 
         elif mode == "semantic":
             if not self.embedding:
@@ -226,9 +276,7 @@ class SearchEngine:
             embedding_results = []
 
             if self.bm25:
-                await self.bm25._build_index()
-                loop = asyncio.get_event_loop()
-                bm25_results = await loop.run_in_executor(None, self.bm25.search, query, session_ids, limit * 2)
+                bm25_results = self.bm25.search(query, session_ids, limit * 2)
             if self.embedding:
                 embedding_results = await self.embedding.search(query, session_ids, limit * 2)
 
@@ -310,3 +358,9 @@ class SearchEngine:
             item["is_running"] = item["session_uuid"] in running_sessions
 
         return enriched[:limit]
+    
+    async def close(self) -> None:
+        """Close all search components and cleanup resources."""
+        if self.bm25:
+            await self.bm25.close()
+        # Embedding search doesn't need cleanup

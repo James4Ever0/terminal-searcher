@@ -7,6 +7,8 @@ logs/*
 log.txt
 *.ansi
 
+*.db
+
 __pycache__/
 *.py[cod]
 *$py.class

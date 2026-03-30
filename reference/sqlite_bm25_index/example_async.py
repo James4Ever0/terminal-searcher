@@ -1,10 +1,10 @@
-import sqlite3
+import aiosqlite
 import math
 import re
 from collections import defaultdict, Counter
 from typing import List, Tuple, Optional, Callable, Union
 
-class BM25SQLiteIndex:
+class BM25SQLiteIndexAsync:
     """
     A BM25 index stored in SQLite with support for unique document IDs,
     incremental addition, and efficient querying.
@@ -34,8 +34,7 @@ class BM25SQLiteIndex:
         b: float = 0.75
     ):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
+        self.conn = None
         self.tokenizer = tokenizer or self._default_tokenizer
         self.k1 = k1
         self.b = b
@@ -51,30 +50,34 @@ class BM25SQLiteIndex:
         self.total_length = 0
         self.avgdl = 0.0
 
-        self._create_tables()
-        self._load_from_db()
+    async def initialize(self) -> None:
+        """Initialize the database connection and load existing data."""
+        self.conn = await aiosqlite.connect(self.db_path)
+        self.conn.row_factory = aiosqlite.Row
+        await self._create_tables()
+        await self._load_from_db()
 
     def _default_tokenizer(self, text: str) -> List[str]:
         """Simple tokenizer: lowercases, splits on whitespace, removes punctuation."""
         text = re.sub(r'[^\w\s]', '', text.lower())
         return text.split()
 
-    def _create_tables(self) -> None:
+    async def _create_tables(self) -> None:
         """Create the necessary tables if they do not exist."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
+        cursor = await self.conn.cursor()
+        await cursor.execute("""
             CREATE TABLE IF NOT EXISTS documents (
                 doc_id TEXT PRIMARY KEY,
                 length INTEGER NOT NULL
             )
         """)
-        cursor.execute("""
+        await cursor.execute("""
             CREATE TABLE IF NOT EXISTS terms (
                 term TEXT PRIMARY KEY,
                 df INTEGER NOT NULL
             )
         """)
-        cursor.execute("""
+        await cursor.execute("""
             CREATE TABLE IF NOT EXISTS postings (
                 term TEXT,
                 doc_id TEXT,
@@ -82,21 +85,21 @@ class BM25SQLiteIndex:
                 PRIMARY KEY (term, doc_id)
             )
         """)
-        cursor.execute("""
+        await cursor.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
         """)
-        self.conn.commit()
+        await self.conn.commit()
 
-    def _load_from_db(self) -> None:
+    async def _load_from_db(self) -> None:
         """Load all index data from SQLite into memory."""
-        cursor = self.conn.cursor()
+        cursor = await self.conn.cursor()
 
         # Load documents
-        cursor.execute("SELECT doc_id, length FROM documents")
-        rows = cursor.fetchall()
+        await cursor.execute("SELECT doc_id, length FROM documents")
+        rows = await cursor.fetchall()
         self.doc_ids = [row["doc_id"] for row in rows]
         self.doc_lengths = [row["length"] for row in rows]
         self.doc_id_to_index = {doc_id: i for i, doc_id in enumerate(self.doc_ids)}
@@ -105,8 +108,8 @@ class BM25SQLiteIndex:
         self.avgdl = self.total_length / self.num_docs if self.num_docs > 0 else 0.0
 
         # Load postings and build term_df
-        cursor.execute("SELECT term, doc_id, tf FROM postings")
-        rows = cursor.fetchall()
+        await cursor.execute("SELECT term, doc_id, tf FROM postings")
+        rows = await cursor.fetchall()
         for row in rows:
             term, doc_id, tf = row["term"], row["doc_id"], row["tf"]
             idx = self.doc_id_to_index[doc_id]
@@ -120,7 +123,7 @@ class BM25SQLiteIndex:
         doc_id = str(doc_id)
         return doc_id in self.doc_id_to_index
 
-    def add_document(self, doc_id: Union[str, int], text: str) -> None:
+    async def add_document(self, doc_id: Union[str, int], text: str) -> None:
         """
         Add a new document to the index.
 
@@ -145,7 +148,7 @@ class BM25SQLiteIndex:
         length = len(tokens)
         if length == 0:
             # Empty document: still add but no terms
-            self._insert_empty_document(doc_id)
+            await self._insert_empty_document(doc_id)
             return
 
         tf_counter = Counter(tokens)
@@ -172,12 +175,12 @@ class BM25SQLiteIndex:
         self.avgdl = self.total_length / self.num_docs
 
         # Persist to SQLite (in a transaction)
-        cursor = self.conn.cursor()
+        cursor = await self.conn.cursor()
         try:
-            cursor.execute("BEGIN TRANSACTION")
+            await cursor.execute("BEGIN TRANSACTION")
 
             # Insert document
-            cursor.execute(
+            await cursor.execute(
                 "INSERT INTO documents (doc_id, length) VALUES (?, ?)",
                 (doc_id, length)
             )
@@ -185,31 +188,31 @@ class BM25SQLiteIndex:
             # Insert/update terms and postings
             for term, tf in tf_counter.items():
                 # UPSERT for term document frequency
-                cursor.execute("""
+                await cursor.execute("""
                     INSERT INTO terms (term, df) VALUES (?, 1)
                     ON CONFLICT(term) DO UPDATE SET df = df + 1
                 """, (term,))
                 # Insert posting
-                cursor.execute(
+                await cursor.execute(
                     "INSERT INTO postings (term, doc_id, tf) VALUES (?, ?, ?)",
                     (term, doc_id, tf)
                 )
 
             # Update metadata
-            cursor.execute(
+            await cursor.execute(
                 "INSERT INTO meta (key, value) VALUES ('num_docs', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = ?",
                 (str(self.num_docs), str(self.num_docs))
             )
-            cursor.execute(
+            await cursor.execute(
                 "INSERT INTO meta (key, value) VALUES ('total_length', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = ?",
                 (str(self.total_length), str(self.total_length))
             )
 
-            cursor.execute("COMMIT")
+            await cursor.execute("COMMIT")
         except Exception:
-            self.conn.rollback()
+            await self.conn.rollback()
             # Rollback in-memory changes
             self.doc_ids.pop()
             self.doc_lengths.pop()
@@ -225,7 +228,7 @@ class BM25SQLiteIndex:
             self.avgdl = self.total_length / self.num_docs if self.num_docs > 0 else 0.0
             raise
 
-    def _insert_empty_document(self, doc_id: str) -> None:
+    async def _insert_empty_document(self, doc_id: str) -> None:
         """Handle insertion of an empty document (no terms)."""
         new_index = self.num_docs
         self.doc_ids.append(doc_id)
@@ -235,23 +238,23 @@ class BM25SQLiteIndex:
         # total_length unchanged (0 added)
         self.avgdl = self.total_length / self.num_docs
 
-        cursor = self.conn.cursor()
-        cursor.execute("BEGIN TRANSACTION")
-        cursor.execute(
+        cursor = await self.conn.cursor()
+        await cursor.execute("BEGIN TRANSACTION")
+        await cursor.execute(
             "INSERT INTO documents (doc_id, length) VALUES (?, ?)",
             (doc_id, 0)
         )
-        cursor.execute(
+        await cursor.execute(
             "INSERT INTO meta (key, value) VALUES ('num_docs', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = ?",
             (str(self.num_docs), str(self.num_docs))
         )
-        cursor.execute(
+        await cursor.execute(
             "INSERT INTO meta (key, value) VALUES ('total_length', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = ?",
             (str(self.total_length), str(self.total_length))
         )
-        cursor.execute("COMMIT")
+        await cursor.execute("COMMIT")
 
     def query(self, query_text: str, top_n: int = 10) -> List[Tuple[str, float]]:
         """
@@ -300,35 +303,38 @@ class BM25SQLiteIndex:
         top_results = [(self.doc_ids[idx], score) for idx, score in indexed_scores[:top_n] if score > 0]
         return top_results
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Close the database connection."""
-        self.conn.close()
+        if self.conn:
+            await self.conn.close()
 
-    def __enter__(self):
+    async def __aenter__(self):
+        await self.initialize()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
 
 # Example usage
-if __name__ == "__main__":
+async def main():
     # Create a new index (or load existing)
-    index = BM25SQLiteIndex("bm25_example.db")
+    async with BM25SQLiteIndexAsync("bm25_example_async.db") as index:
+        # Add some documents
+        docs = [
+            ("doc1", "The quick brown fox jumps over the lazy dog"),
+            ("doc2", "A quick brown dog jumps over a lazy fox"),
+            ("doc3", "The lazy dog sleeps under the tree"),
+        ]
+        for doc_id, text in docs:
+            if not index.exists(doc_id):
+                await index.add_document(doc_id, text)
 
-    # Add some documents
-    docs = [
-        ("doc1", "The quick brown fox jumps over the lazy dog"),
-        ("doc2", "A quick brown dog jumps over a lazy fox"),
-        ("doc3", "The lazy dog sleeps under the tree"),
-    ]
-    for doc_id, text in docs:
-        if not index.exists(doc_id):
-            index.add_document(doc_id, text) # if it exists, will raise ValueError.
+        # Query
+        results = index.query("quick fox")
+        for doc_id, score in results:
+            print(f"{doc_id}: {score:.4f}")
 
-    # Query
-    results = index.query("quick fox")
-    for doc_id, score in results:
-        print(f"{doc_id}: {score:.4f}")
-
-    index.close()
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())

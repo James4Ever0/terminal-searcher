@@ -20,3 +20,6 @@
 - [ ] separate terminal server and webui, first spin up server from cli to receive terminal creation, reconnect request, do periodic tasks and run workers, then webui just attach to the server designated socket and method, perform search etc.
 - [ ] search result is empty again. also try to refresh index in the background.
 - [ ] terminal screenshot not working properly. pending test.
+- [ ] disable full scrollback capture, use only recent lines
+- [ ] why bm25index background process will not skip quickly indexed ones? skip those already in memory, do not read from database, just use in memory index. also mark those missing in database.
+- [ ] increase logging in bm25 sqlite, make it async. why loading from db is damn slow? and refreshing index too? is it because of too large of the document length? log that too. log time used for each document. show warning for large document and long loading time, long loop and long function calls.

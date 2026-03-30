@@ -77,6 +77,8 @@ async def lifespan(app: FastAPI):
     if config.is_module_enabled("history_keeper"):
         logger.info("Initializing search engine (history_keeper enabled)...")
         search_engine = SearchEngine(db)
+        logger.info("Search engine created")
+        await search_engine.initialize()
         logger.info("Search engine initialized")
     else:
         logger.warning("History keeper disabled - search functionality unavailable")

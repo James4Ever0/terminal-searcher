@@ -172,6 +172,7 @@ search:
     k1: 1.5
     b: 0.75
     default_limit: 50
+    rebuild_interval_seconds: 10
   embedding:
     default_limit: 50
   context_lines: 3
