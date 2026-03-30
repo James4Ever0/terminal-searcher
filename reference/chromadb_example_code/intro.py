@@ -1,6 +1,8 @@
 # for pure vector search, use duckdb instead. offer document id constraint?
 # https://developers.llamaindex.ai/python/framework-api-reference/storage/vector_store/duckdb/
+
 # https://blog.brunk.io/posts/similarity-search-with-duckdb
+# https://duckdb.org/docs/lts/core_extensions/vss
 
 # check out more embedding search backend in llamaindex documentation
 # https://developers.llamaindex.ai/python/framework-api-reference/storage/docstore/
