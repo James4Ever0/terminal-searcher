@@ -1,1 +1,25 @@
 this sucks. python3.10 with no luck to install. maybe it requires specific python version to install? or i need docker image? really nonsense.
+
+maybe we should create a vector search db using hnswlib by reading the code base of docarray and vectordb, with no other shitty dependencies? or find existing ones instead?
+
+for chromadb, maybe we can compile some standalone "core" binding to rust vector search lib.
+
+since we can resize the hnswlib index, maybe consider we use hnswlib instead? it can replace old ones on adding new ones.
+
+also shall we install usearch from source? from github hash commit? no source tarball on pypi?
+
+we can load sqlite extension from release: https://github.com/unum-cloud/USearch/releases/tag/v2.24.0
+
+usearch has third party deps. may be hard to compile?
+
+https://github.com/unum-cloud/USearch/releases/download/v2.24.0/usearch_sqlite_linux_arm64_2.24.0.so
+
+https://unum-cloud.github.io/USearch/sqlite/
+
+not working:
+
+export CMAKE_ARGS="-DCMAKE_USE_SYSTEM_LIBUV=ON -DCMAKE_USE_SYSTEM_LIBARCHIVE=ON"
+
+https://gitlab.kitware.com/cmake/cmake/-/work_items/21399
+
+uv pip install git+https://github.com/unum-cloud/USearch@40d127f472e9073875566f0e9308c0302b89100a
