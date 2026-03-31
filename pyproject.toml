@@ -42,6 +42,7 @@ dependencies = [
 embedding = [
     "requests>=2.31.0",
     "numpy>=1.24.0",
+    "usearch>=2.20.8",
 ]
 screenshot = [
     "agg_python_bindings==0.1.4",
