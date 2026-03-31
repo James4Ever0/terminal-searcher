@@ -187,6 +187,11 @@ async def debug_exception_handler(request: Request, exc: Exception):
             content={"detail": "Internal Server Error"},
         )
 
+@app.get("/healthcheck")
+async def healthcheck():
+    """Check server health"""
+    return {"status": "ok"}
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Serve the main terminal UI with Jinja2 templating for verbosity."""

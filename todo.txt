@@ -23,3 +23,4 @@
 - [ ] disable full scrollback capture, use only recent lines
 - [ ] why bm25index background process will not skip quickly indexed ones? skip those already in memory, do not read from database, just use in memory index. also mark those missing in database.
 - [ ] increase logging in bm25 sqlite, make it async. why loading from db is damn slow? and refreshing index too? is it because of too large of the document length? log that too. log time used for each document. show warning for large document and long loading time, long loop and long function calls.
+- [ ] add healthcheck api endpoint in backend, (already added in /healthcheck, will return {"status": "ok"}) test if terminal is offline in frontend, reattach if possible from frontend. (backend may also persist session, but leave it for simplicity for now? or use a button called "reattach all unattached, running sessions" in frontend?)

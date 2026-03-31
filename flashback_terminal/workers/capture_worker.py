@@ -4,6 +4,7 @@ Captures terminal content from screen/tmux sessions and renders screenshots
 using agg_python_bindings.
 """
 
+import asyncio
 import time
 import traceback
 from datetime import datetime
@@ -147,8 +148,9 @@ class CaptureWorker:
             # Render screenshot if we have ANSI content and renderer is available
             screenshot_path = None
             if capture.ansi and self._has_renderer:
-                screenshot_path = self._render_screenshot(
-                    session_id, db_session.id, capture.ansi, cols=cols, rows=rows
+                loop = asyncio.get_event_loop()
+                screenshot_path = await loop.run_in_executor(None, self._render_screenshot,
+                    session_id, db_session.id, capture.ansi, cols, rows
                 )
 
             # Save text content (OCR result)
