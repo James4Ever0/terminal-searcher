@@ -149,7 +149,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         {
             "name": "default",
             "shell": None,
-            "args": [],
+            "args": ["-c", "unset TMUX TMUX_PANE TMUX_WINDOW TMUX_SESSION TMUX_TMPDIR SCREENDIR STY; exec bash"],
             "env": {},
             "cwd": "~",
             "description": "Standard shell",
