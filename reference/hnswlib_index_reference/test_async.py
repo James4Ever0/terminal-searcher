@@ -11,7 +11,6 @@ import numpy as np
 import tempfile
 import logging
 import time
-from pathlib import Path
 import sys
 
 # Add current directory to path to import modules
