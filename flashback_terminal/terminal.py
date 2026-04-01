@@ -7,6 +7,7 @@ This enables backend screenshot capture and text extraction.
 import uuid as uuid_mod
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
+import os
 
 from flashback_terminal.config import get_config
 from flashback_terminal.database import Database
@@ -187,8 +188,24 @@ class TerminalManager:
             
             if db_session.session_type == "tmux":
                 socket_dir = config.get("session_manager.tmux.socket_dir", "~/.flashback-terminal/tmux")
-                # TODO: access socket later.
-                socket_accessible = True
+
+                socket_dir = os.path.expanduser(socket_dir)
+                socket_accessible=False
+
+                if not os.path.isdir(socket_dir):
+                    logger.warning(f"[TerminalManager] Socket directory {socket_dir} does not exist, cannot verify presense of tmux session")
+                else:
+                    # check if in this dir there is a file with session_uuid in it.
+                    files: list[str] = os.listdir(socket_dir)
+
+                    # filter out those config files, also socket file is of zero file length.
+                    files = [it for it in files if not it.endswith(".conf")]
+
+                    if "flashback-" + session_uuid in files:
+                        socket_accessible = True
+                    else:
+                        logger.warning(f"[TerminalManager] Tmux socket file for session {session_uuid} not found in {socket_dir}")
+                        
                 if socket_accessible:
                     # Create proper TerminalSession wrapper
                     terminal_session = TerminalSession(
@@ -217,7 +234,26 @@ class TerminalManager:
                     return None
             elif db_session.session_type == "screen":
                 socket_dir = config.get("session_manager.screen.socket_dir", "~/.flashback-terminal/screen")
-                socket_accessible=True
+
+                socket_dir = os.path.expanduser(socket_dir)
+                socket_accessible=False
+
+                if not os.path.isdir(socket_dir):
+                    logger.warning(f"[TerminalManager] Socket directory {socket_dir} does not exist, cannot verify presense of screen session")
+                else:
+                    # check if in this dir there is a file with session_uuid in it.
+                    files = os.listdir(socket_dir)
+
+                    files = [it for it in files if not it.endswith(".rc")]
+                    files = [it for it in files if it.count(".") == 1]
+
+                    socket_lookups = [it.split(".", 1)[1] for it in files] # remove pid?
+
+                    if "flashback-" + session_uuid in socket_lookups:
+                        socket_accessible = True
+                    else:
+                        logger.warning(f"[TerminalManager] Screen socket file for session {session_uuid} not found in {socket_dir}")
+
                 if socket_accessible:
                     # Create proper TerminalSession wrapper
                     terminal_session = TerminalSession(

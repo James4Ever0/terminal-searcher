@@ -31,3 +31,4 @@
 - [ ] generate default terminal title based on terminal index from db, and allow user to change it, not generated from frontend javascript
 - [ ] allow user to close terminal window in frontend, close connection. however, do not terminate the background terminal session.
 - [ ] separate backend api for create, stop, restore, attach sessions.
+- [ ] filter out those non-default terminal type (like screen in tmux default config) ones in session enumeration, or add params for query such results, or attach to them using different handlers based on db data.
