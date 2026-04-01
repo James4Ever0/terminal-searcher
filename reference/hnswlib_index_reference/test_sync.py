@@ -14,7 +14,7 @@ import sys
 # Add current directory to path to import sync module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sync import HNSWIndex
+from hnswlib_index_sync import HNSWIndex
 
 # Configure logging
 logging.basicConfig(

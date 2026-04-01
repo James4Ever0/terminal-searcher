@@ -16,7 +16,7 @@ import sys
 # Add current directory to path to import modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from async import AsyncHNSWIndex, create_async_hnsw_index
+from hnswlib_index_async import AsyncHNSWIndex, create_async_hnsw_index
 
 # Configure logging
 logging.basicConfig(
