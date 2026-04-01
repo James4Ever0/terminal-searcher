@@ -25,7 +25,48 @@ class TerminalWebSocketHandler:
 
     async def handle(self, websocket: WebSocket, session_uuid: str) -> None:
         """Handle a WebSocket connection."""
+        # TODO: ask user to abort connection if session id already exists in active connections, in frontend.
         await websocket.accept()
+        if session_uuid in self.active_connections:
+            # maybe we should ask user to decide whether to abort the existing connection
+            await websocket.send_json({
+                "type": "session_already_exists",
+                "message": "Session with this ID already exists",
+            })
+            # receive some message from frontend
+            message = await websocket.receive_text()
+            try:
+                message = json.loads(message)
+            except json.JSONDecodeError:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Cannot parse JSON",
+                })
+                await websocket.close()
+                return
+            logger.info(f"[WebSocket] Received message: {message}")
+            if type(message) != dict:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "JSON object is not a dictionary",
+                })
+                await websocket.close()
+                return
+            if message.get("action") == "abort":
+                await websocket.close()
+                return
+            elif message.get("action") == "continue":
+                # abort old connection
+                old_websocket = self.active_connections[session_uuid]
+                await old_websocket.close()
+                del self.active_connections[session_uuid]
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Invalid action",
+                })
+                await websocket.close()
+                return
 
         config = get_config()
 
@@ -116,7 +157,8 @@ class TerminalWebSocketHandler:
         )
 
         if config.is_module_enabled("session_recovery"):
-            await self._replay_history(websocket, session.session_id)
+            # let's not replay history? do you even know how to? why bloody unrecognized characters?
+            # await self._replay_history(websocket, session.session_id)
             await self._restore_cwd(websocket, session)
 
         try:

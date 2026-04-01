@@ -263,6 +263,7 @@ set -g default-terminal "screen-256color"
                 # cannot pass empty dict, otherwise we will fail to obtain output or spawn process
                 os.execvpe(shutil.which("tmux"), [shutil.which("tmux")] + args, dict(SHELL='/bin/bash', TERM='xterm-256color', LANG='en_US.UTF-8'))
             else:
+                # Why this sends to websocket?
                 logger.debug(f"[TmuxSession] Attached to tmux session at {self._socket_path}")
                 self._running = True
                 return True

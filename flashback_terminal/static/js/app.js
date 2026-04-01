@@ -560,6 +560,8 @@ class App {
     }
 
     async switchToSession(sessionUuid) {
+        const exitLog = FrontendLogger.logFunction('App.switchToSession');
+
         // Check if we already have a tab for this session
         const existingTab = this.tabs.find(t => t.uuid === sessionUuid);
         if (existingTab) {
@@ -568,9 +570,8 @@ class App {
             return;
         }
 
-        // Create a new tab for the existing session
-        await this.createTab(sessionUuid);
-        this.closeSessionsModal();
+        await this.attachToSession(sessionUuid);
+        // this.closeSessionsModal();
     }
 
     async attachToSession(sessionUuid) {
