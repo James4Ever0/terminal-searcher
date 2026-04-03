@@ -33,3 +33,4 @@
 - [ ] separate backend api for create, stop, restore, attach sessions.
 - [ ] filter out those non-default terminal type (like screen in tmux default config) ones in session enumeration, or add params for query such results, or attach to them using different handlers based on db data.
 - [ ] highlight keyword when terminal text result showing up, using backend?
+- [ ] store terminal text hash alongside with screenshot text, if last hash is equal to current screenshot hash then will drop the capture
