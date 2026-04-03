@@ -235,13 +235,40 @@ async def terminal_websocket(websocket: WebSocket, session_uuid: str):
     if ws_handler:
         await ws_handler.handle(websocket, session_uuid)
 
+@app.post("/api/sessions/{session_uuid}/force-attach")
+@log_function(Logger.DEBUG)
+async def force_attach_to_session(session_uuid:str):
+    logger.info(f"[Server] Force attach request for session: {session_uuid}")
+
+    if not ws_handler:
+        logger.error("[Server] Websocket handler not available")
+        raise HTTPException(status_code=503, detail="Websocket handler not available")
+
+    if session_uuid in ws_handler.active_connections:
+        # force close connection?
+        logger.info("[Server] Found session %s in websocket connections" % session_uuid)
+        await ws_handler.active_connections[session_uuid].close()
+        del ws_handler.active_connections[session_uuid]
+        logger.info("[Server] Force closed websocket connection %s" % session_uuid)
+    return await _attach_to_session(session_uuid)
 
 @app.post("/api/sessions/{session_uuid}/attach")
 @log_function(Logger.DEBUG)
 async def attach_to_session(session_uuid: str):
     """Attach to an existing terminal session."""
-    logger.info(f"[Server] Attach request for session: {session_uuid}")
+    return await _attach_to_session(session_uuid)
     
+async def _attach_to_session(session_uuid: str):
+    logger.info(f"[Server] Attach request for session: {session_uuid}")
+
+    if not ws_handler:
+        logger.error("[Server] Websocket handler not available")
+        raise HTTPException(status_code=503, detail="Websocket handler not available")
+    
+    if not db:
+        logger.error("[Server] Database not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+
     if not terminal_manager:
         logger.error("[Server] Terminal manager not available")
         raise HTTPException(status_code=503, detail="Terminal manager not available")
@@ -251,6 +278,7 @@ async def attach_to_session(session_uuid: str):
         logger.warning(f"[Server] Session {session_uuid} is already running in terminal manager")
         # check if it is attached to websocket manager
         if session_uuid in ws_handler.active_connections:
+            # force close connection?
             raise HTTPException(status_code=409, detail="Session is already running and attached.")
         else:
             # just return the result
@@ -337,13 +365,22 @@ async def list_sessions(
     """List terminal sessions."""
     logger.debug(f"list_sessions called: status={status}, limit={limit}, offset={offset}")
 
+    if not db:
+        logger.error("[Server] Database not available")
+        raise HTTPException(status_code=503, detail="Database not available")
+
     sessions = await db.list_sessions(status=status, limit=limit, offset=offset)
     
     # Check which sessions are currently running in terminal manager
     # TODO: attach to previous running sessions in db?
     running_sessions = set()
+
     if terminal_manager:
         running_sessions = set(terminal_manager.sessions.keys())
+
+    if not terminal_manager:
+        logger.error("[Server] Terminal manager not available")
+        raise HTTPException(status_code=503, detail="Terminal manager not available")
 
     logger.info(f"Listed {len(sessions)} sessions (status={status}, limit={limit})")
 
@@ -352,9 +389,16 @@ async def list_sessions(
     loop = asyncio.get_event_loop()
     socket_present_results = await loop.run_in_executor(None, batch_check_socket_present, sessions_for_socket_present_check)
 
-    return {
-        "sessions": [
-            {
+    ret_sessions = []
+
+    for s in sessions:
+        sess_running = False
+        if s.uuid in running_sessions:
+            if terminal_manager.sessions[s.uuid].is_running_buffered:
+                term_manager_base_session = terminal_manager.sessions[s.uuid]._session
+                if term_manager_base_session is not None:
+                    sess_running = await term_manager_base_session._is_running()
+        it = {
                 "id": s.id,
                 "uuid": s.uuid,
                 "name": s.name,
@@ -362,13 +406,15 @@ async def list_sessions(
                 "created_at": s.created_at.isoformat(),
                 "status": s.status,
                 "last_cwd": s.last_cwd,
-                "is_running": s.uuid in running_sessions and terminal_manager.sessions[s.uuid].is_running_buffered and await terminal_manager.sessions[s.uuid]._session._is_running(),
+                "is_running": sess_running,
                 "can_attach": s.status in ("active", "running") and s.uuid not in running_sessions,
                 "session_type": s.session_type, # either tmux or screen
                 "socket_present": socket_present_results[s.uuid], # to be implemented, only if you know this is a tmux or screen session.
-            }
-            for s in sessions
-        ]
+        }
+        ret_sessions.append(it)
+
+    return {
+        "sessions": ret_sessions
     }
 
 

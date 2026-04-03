@@ -118,19 +118,19 @@ class TerminalTab {
 
         this.socket.onclose = async () => {
             FrontendLogger.info(`WebSocket closed: uuid=${this.uuid}`);
-            
+
             // Check backend health first
             try {
                 const healthResponse = await fetch('/healthcheck');
                 const isBackendHealthy = healthResponse.ok;
-                
+
                 if (!isBackendHealthy) {
                     // Backend is down, likely network issue
                     FrontendLogger.warn('Backend healthcheck failed - possible network issue');
                     // TODO: Show reconnect notification when backend is back
                     return;
                 }
-                
+
                 // Check if session is still running in backend
                 try {
                     const sessionResponse = await fetch(`/api/sessions/${this.uuid}`);
@@ -194,7 +194,7 @@ class TerminalTab {
                 }
                 break;
             case "cursor":
-                this.terminal.write("\x1b["+(msg.row)+";"+(msg.col+1)+"H");
+                this.terminal.write("\x1b[" + (msg.row) + ";" + (msg.col + 1) + "H");
                 break;
             case 'clear':
                 this.terminal.clear();
@@ -213,7 +213,7 @@ class TerminalTab {
                 // log session info
                 console.log(`[WebSocket] Session info: uuid=${this.uuid}, name=${this.name}`);
                 this.updateTabTitle();
-                
+
                 // Show restoration notification if applicable
                 if (msg.restored) {
                     this.terminal.writeln(`\r\n[flashback] Session restored successfully`);
@@ -292,17 +292,17 @@ class TerminalTab {
     updateTabTitle() {
         const displayName = this.titleOverride || this.name || this.originalName;
         FrontendLogger.debug(`Updating tab title to: ${displayName}`);
-        
+
         // Update tab element if it exists
         if (this.app && this.app.activeTab === this) {
             this.app.renderTabs();
         }
-        
+
         // Set window title if this is the active tab
         if (this.app && this.app.activeTab === this) {
             document.title = `${displayName} - flashback-terminal`;
         }
-        
+
         // Send title change to backend to propagate to terminal
         if (this.socket && this.socket.readyState === WebSocket.OPEN) {
             this.socket.send(JSON.stringify({
@@ -380,7 +380,7 @@ class App {
         }
 
         FrontendLogger.info(`Restoring ${savedState.tabs.length} tabs from saved state`);
-        
+
         const restoredTabs = [];
         let activeTabRestored = null;
 
@@ -394,17 +394,17 @@ class App {
                 if (response.ok) {
                     const result = await response.json();
                     FrontendLogger.info(`Successfully restored tab: ${savedTab.name} (${savedTab.uuid})`);
-                    
+
                     // Create tab instance
                     const tab = new TerminalTab(result.uuid, result.name);
                     tab.originalName = savedTab.originalName;
                     tab.titleOverride = savedTab.titleOverride;
                     tab.app = this;
-                    
+
                     this.tabs.push(tab);
                     await tab.connect();
                     restoredTabs.push(tab);
-                    
+
                     // Set as active tab if it was the active one
                     if (savedTab.uuid === savedState.activeTabUuid) {
                         activeTabRestored = tab;
@@ -455,7 +455,7 @@ class App {
 
         // TODO: only if no tab to attach (all tabs in background are not running), we would create a new one instead. otherwise attach existing ones.
         // await this.createTab();
-        
+
         // Restore previous tabs if available
         await this.restoreTabs();
     }
@@ -465,10 +465,10 @@ class App {
             FrontendLogger.warn('No active tab to set title for');
             return;
         }
-        
+
         const titleInput = document.getElementById('title-input');
         const newTitle = titleInput.value.trim();
-        
+
         if (newTitle) {
             FrontendLogger.info(`Setting title for active tab: ${newTitle}`);
             this.activeTab.setTitle(newTitle);
@@ -485,8 +485,8 @@ class App {
 
         const response = await fetch('/api/sessions', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({profile: 'default'})
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile: 'default' })
         });
 
         if (!response.ok) {
@@ -515,22 +515,22 @@ class App {
         tab.terminal.element.style.display = 'block';
         tab.focus();
         this.renderTabs();
-        
+
         // Update window title to reflect active tab
         const displayName = tab.titleOverride || tab.name || tab.originalName;
         document.title = `${displayName} - flashback-terminal`;
-        
+
         // Save state after switching tabs
         this.saveTabState();
     }
 
     closeTab(tab) {
         FrontendLogger.info(`Closing tab: uuid=${tab.uuid}`);
-        
+
         // Find index of the tab
         const tabIndex = this.tabs.indexOf(tab);
         if (tabIndex === -1) return;
-        
+
         // Send disconnect message to backend before closing
         if (tab.socket && tab.socket.readyState === WebSocket.OPEN) {
             tab.socket.send(JSON.stringify({
@@ -538,13 +538,13 @@ class App {
                 keep_session_alive: true
             }));
         }
-        
+
         // Dispose the tab (closes WebSocket and terminal, but doesn't terminate backend session)
         tab.dispose();
-        
+
         // Remove tab from array
         this.tabs.splice(tabIndex, 1);
-        
+
         // If we closed the active tab, switch to another one
         if (this.activeTab === tab) {
             if (this.tabs.length > 0) {
@@ -558,13 +558,13 @@ class App {
                 document.title = 'flashback-terminal';
             }
         }
-        
+
         // Re-render tabs
         this.renderTabs();
-        
+
         // Save state after closing tab
         this.saveTabState();
-        
+
         FrontendLogger.info(`Tab closed successfully: uuid=${tab.uuid}`);
     }
 
@@ -579,12 +579,12 @@ class App {
             this.activeTab = draggedTab;
             draggedTab.terminal.element.style.display = 'block';
             draggedTab.focus();
-            
+
             // Update window title
             const displayName = draggedTab.titleOverride || draggedTab.name || draggedTab.originalName;
             document.title = `${displayName} - flashback-terminal`;
         }
-        
+
         FrontendLogger.debug(`Drag started: tab index ${tabIndex}`);
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/html', tabIndex);
@@ -628,12 +628,12 @@ class App {
             const draggedTab = this.tabs[this.draggedTabIndex];
             this.tabs.splice(this.draggedTabIndex, 1);
             this.tabs.splice(dropTabIndex, 0, draggedTab);
-            
+
             FrontendLogger.info(`Tab reordered: from index ${this.draggedTabIndex} to ${dropTabIndex}`);
-            
+
             // Re-render tabs to update the order
             this.renderTabs();
-            
+
             // Save state after reordering tabs
             this.saveTabState();
         }
@@ -665,7 +665,7 @@ class App {
             }
 
             this.currentPreviewTab = tab;
-            
+
             // Create or get preview container
             let previewContainer = document.getElementById('tab-preview');
             if (!previewContainer) {
@@ -682,22 +682,22 @@ class App {
             previewContent.style.position = 'static';
             previewContent.style.height = '400px';
             previewContent.style.overflow = 'hidden';
-            
+
             // Clear preview container and add content
             previewContainer.innerHTML = '';
             previewContainer.appendChild(previewContent);
-            
+
             // Position preview relative to the terminal container
             const terminalContainer = document.getElementById('terminal-container');
             const containerRect = terminalContainer.getBoundingClientRect();
-            
+
             previewContainer.style.position = 'fixed';
             previewContainer.style.top = `${containerRect.top + 20}px`;
             previewContainer.style.left = `${containerRect.left + 20}px`;
             previewContainer.style.width = `${containerRect.width - 40}px`;
             previewContainer.style.zIndex = '1000';
             previewContainer.style.display = 'block';
-            
+
             FrontendLogger.debug(`Showing preview for tab: ${tab.name}`);
         }, 500); // 500ms delay
     }
@@ -714,7 +714,7 @@ class App {
         if (previewContainer) {
             previewContainer.style.display = 'none';
         }
-        
+
         this.currentPreviewTab = null;
         FrontendLogger.debug('Hiding tab preview');
     }
@@ -729,9 +729,9 @@ class App {
             tabEl.className = 'tab' + (tab === this.activeTab ? ' active' : '');
             tabEl.draggable = true;
             tabEl.dataset.tabIndex = i;
-            
+
             const displayName = tab.titleOverride || tab.name || tab.originalName;
-            
+
             // Create tab content container
             // too small for click event?
             const tabContent = document.createElement('span');
@@ -740,7 +740,7 @@ class App {
             tabContent.title = `Session: ${tab.originalName}\nCurrent: ${displayName}\nUUID: ${tab.uuid}`;
 
             // tabContent.addEventListener('click', () => this.switchTab(tab));
-            
+
             // Create close button
             const closeBtn = document.createElement('span');
             closeBtn.className = 'tab-close';
@@ -760,11 +760,11 @@ class App {
             tabEl.addEventListener('dragend', (e) => this.handleDragEnd(e, tab));
             tabEl.addEventListener('dragenter', (e) => this.handleDragEnter(e));
             tabEl.addEventListener('dragleave', (e) => this.handleDragLeave(e));
-            
+
             // Add hover preview event listeners
             tabEl.addEventListener('mouseenter', (e) => this.showTabPreview(tab, tabEl));
             tabEl.addEventListener('mouseleave', () => this.hideTabPreview());
-            
+
             tabEl.appendChild(tabContent);
             tabEl.appendChild(closeBtn);
             container.appendChild(tabEl);
@@ -772,6 +772,13 @@ class App {
     }
 
     openSearch() {
+        // Reset search form to pristine state
+        document.getElementById('search-input').value = '';
+        document.getElementById('search-results').innerHTML = '';
+        document.getElementById('search-mode').value = 'text';
+        document.getElementById('search-scope').value = 'current';
+        
+        // Show the modal
         document.getElementById('search-modal').classList.remove('hidden');
     }
 
@@ -783,17 +790,17 @@ class App {
         FrontendLogger.info(`Search initiated: query="${query}", mode=${mode}, scope=${scope}`);
         const exitLog = FrontendLogger.logFunction('App.doSearch', { query, mode, scope });
 
-        if (scope === 'current'){
-            if (this.activeTab){
+        if (scope === 'current') {
+            if (this.activeTab) {
                 FrontendLogger.info("Searching in current tab");
-            }else{
+            } else {
                 FrontendLogger.warn("No active tab to search in");
                 // alert user
                 alert("No active tab to search in");
                 return;
             }
         }
-        
+
         // Show searching feedback
         this.renderSearchStatus('Searching...');
 
@@ -804,7 +811,7 @@ class App {
         try {
             const response = await fetch('/api/search', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     query: query,
                     mode: mode,
@@ -849,7 +856,7 @@ class App {
         const runningUuids = new Set(this.tabs.map(tab => tab.uuid));
 
         var sessions_map = {};
-        for (let it of allSessionsData.sessions){
+        for (let it of allSessionsData.sessions) {
             sessions_map[it.uuid] = it;
         }
 
@@ -865,27 +872,37 @@ class App {
 
             var buttonClass = isRunning ? 'jump-btn' : 'jump-btn disabled';
             var buttonText = isRunning ? 'Jump to Terminal' : 'Terminal Not Available';
-            var onClick = isRunning? `app.jumpToTerminal('${r.session_uuid}')` : '';
+            var onClick = isRunning ? `app.jumpToTerminal('${r.session_uuid}')` : '';
 
             // if not in current opened tab set, at least we should get all session status?
-            
+
             // console.log("allSessionsData:", allSessionsData);
             // console.log("Session uuid:", r.session_uuid);
 
-            if (buttonClass !== 'jump-btn'){
+            if (buttonClass !== 'jump-btn') {
                 const sess = sessions_map[r.session_uuid];
 
-                if (sess){
+                if (sess) {
                     // TODO: if it is attachable, socket present, then we shall attach to it. otherwise we clone it. add attribute: socket_present
-                    if (sess.socket_present){
-                    buttonClass = 'btn-attach';
-                    buttonText = 'Attach';
-                    onClick = `app.attachToSession('${r.session_uuid}')`;
+                    if (sess.socket_present) {
+
+                        const existingTab = this.tabs.find(t => t.uuid === sess.uuid);
+
+                        if (existingTab) {
+                            buttonClass = 'btn-attach';
+                            buttonText = 'Attach';
+                            onClick = `app.attachToSession('${r.session_uuid}')`;
+                        } else {
+                            buttonClass = 'btn-attach';
+                            buttonText = 'Force Attach';
+                            onClick = `app.forceAttachToSession('${r.session_uuid}')`;
+                        }
+                    } else {
+                        buttonClass = 'btn-restore';
+                        buttonText = 'Revive';
+                        onClick = `app.reviveSession('${r.session_uuid}')`;
+                    }
                 } else {
-                    buttonClass = 'btn-restore';
-                    buttonText = 'Revive';
-                    onClick = `app.reviveSession('${r.session_uuid}')`;
-                }}else{
                     buttonClass = 'jump-btn disabled'
                     buttonText = "Terminal not available"
                     onClick = '';
@@ -928,7 +945,7 @@ class App {
     }
 
     closeSearchModal() {
-        if (!document.getElementById('search-modal').classList.contains('hidden')){
+        if (!document.getElementById('search-modal').classList.contains('hidden')) {
             document.getElementById('search-modal').classList.add('hidden');
         }
     }
@@ -943,7 +960,7 @@ class App {
         const data = await response.json();
 
         const container = document.getElementById('sessions-list');
-        
+
         if (data.sessions.length === 0) {
             container.innerHTML = '<div class="no-sessions">No sessions found</div>';
             return;
@@ -957,10 +974,10 @@ class App {
         ` + data.sessions.map(s => {
             const createdDate = new Date(s.created_at);
             const formattedDate = createdDate.toLocaleString();
-            
+
             // Determine what actions are available for this session
             let actionButtons = '';
-            
+
             // how do you know it is "running"? has websocket connection? or "is_attached"?
             // logic is unclear. to be refactored.
             // if the socket is gone, then it must not be running.
@@ -968,17 +985,18 @@ class App {
             if (s.is_running) {
                 // Check if we have this tab?
                 const existingTab = this.tabs.find(t => t.uuid === s.uuid);
-                if (existingTab)
-                {
+                if (existingTab) {
                     // Session is already running, can switch to it
                     actionButtons = `
                     <button class="btn-switch" onclick="app.switchToSession('${s.uuid}')">Switch To</button>
-                `;}
-                else{
+                `;
+                }
+                else {
                     // Session is running but we don't have a tab for it
                     actionButtons = `
-                    <button class="btn-attach" onclick="app.switchToSession('${s.uuid}')">Attach To (maybe already running elsewhere)</button>
-                `;}
+                    <button class="btn-attach" onclick="app.forceSwitchToSession('${s.uuid}')">Force Attach</button>
+                `;
+                }
             } else if (s.socket_present) {
                 // Session can be attached/restored
                 actionButtons = `
@@ -1018,6 +1036,23 @@ class App {
         }).join('');
     }
 
+
+    async forceSwitchToSession(sessionUuid) {
+        const exitLog = FrontendLogger.logFunction('App.forceSwitchToSession');
+
+        // Check if we already have a tab for this session
+        const existingTab = this.tabs.find(t => t.uuid === sessionUuid);
+        if (existingTab) {
+            this.switchTab(existingTab);
+            this.closeSessionsModal();
+            this.closeSearchModal();
+            return;
+        }
+
+        await this.forceAttachToSession(sessionUuid);
+        // this.closeSessionsModal();
+    }
+
     async switchToSession(sessionUuid) {
         const exitLog = FrontendLogger.logFunction('App.switchToSession');
 
@@ -1034,27 +1069,28 @@ class App {
         // this.closeSessionsModal();
     }
 
-    async attachToSession(sessionUuid) {
-        const exitLog = FrontendLogger.logFunction('App.attachToSession');
+
+    async forceAttachToSession(sessionUuid) {
+        const exitLog = FrontendLogger.logFunction('App.forceAttachToSession');
 
         try {
-            this.showLoading(`Attaching to session ${sessionUuid}...`);
-            
-            const response = await fetch(`/api/sessions/${sessionUuid}/attach`, {
+            this.showLoading(`Force attaching to session ${sessionUuid}...`);
+
+            const response = await fetch(`/api/sessions/${sessionUuid}/force-attach`, {
                 method: 'POST'
             });
-            
+
             if (!response.ok) {
                 const error = await response.json();
-                throw new Error(error.detail || 'Failed to attach to session');
+                throw new Error(error.detail || 'Failed to force attach to session');
             }
-            
+
             const result = await response.json();
-            console.log('Attached to session:', result);
-            
+            console.log('Force attached to session:', result);
+
             // Create a new tab for the attached session
             const tab = new TerminalTab(result.uuid, result.name);
-            tab.app=this;
+            tab.app = this;
             this.tabs.push(tab);
             await tab.connect();
 
@@ -1064,10 +1100,51 @@ class App {
             this.closeSessionsModal();
             this.closeSearchModal();
             this.hideLoading();
-            
+
             // Save state after attaching to session
             this.saveTabState();
-            
+
+        } catch (error) {
+            console.error('Failed to force attach to session:', error);
+            this.showError(`Failed to force attach to session: ${error.message}`);
+            this.hideLoading();
+        }
+    }
+
+    async attachToSession(sessionUuid) {
+        const exitLog = FrontendLogger.logFunction('App.attachToSession');
+
+        try {
+            this.showLoading(`Attaching to session ${sessionUuid}...`);
+
+            const response = await fetch(`/api/sessions/${sessionUuid}/attach`, {
+                method: 'POST'
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'Failed to attach to session');
+            }
+
+            const result = await response.json();
+            console.log('Attached to session:', result);
+
+            // Create a new tab for the attached session
+            const tab = new TerminalTab(result.uuid, result.name);
+            tab.app = this;
+            this.tabs.push(tab);
+            await tab.connect();
+
+            this.switchTab(tab);
+            this.renderTabs();
+
+            this.closeSessionsModal();
+            this.closeSearchModal();
+            this.hideLoading();
+
+            // Save state after attaching to session
+            this.saveTabState();
+
         } catch (error) {
             console.error('Failed to attach to session:', error);
             this.showError(`Failed to attach to session: ${error.message}`);
@@ -1080,22 +1157,22 @@ class App {
 
         try {
             this.showLoading(`Reviving session ${sessionUuid}...`);
-            
+
             const response = await fetch(`/api/sessions/${sessionUuid}/revive`, {
                 method: 'POST'
             });
-            
+
             if (!response.ok) {
                 const error = await response.json();
                 throw new Error(error.detail || 'Failed to revive session');
             }
-            
+
             const result = await response.json();
             console.log('Revived and attached to session:', result);
-            
+
             // Create a new tab for the attached session
             const tab = new TerminalTab(result.uuid, result.name);
-            tab.app=this;
+            tab.app = this;
             this.tabs.push(tab);
             await tab.connect();
 
@@ -1105,7 +1182,7 @@ class App {
             this.closeSessionsModal();
             this.closeSearchModal();
             this.hideLoading();
-            
+
             // Save state after restoring session
             this.saveTabState();
         } catch (error) {
@@ -1120,22 +1197,22 @@ class App {
 
         try {
             this.showLoading(`Restoring session ${sessionUuid}...`);
-            
+
             const response = await fetch(`/api/sessions/${sessionUuid}/restore`, {
                 method: 'POST'
             });
-            
+
             if (!response.ok) {
                 const error = await response.json();
                 throw new Error(error.detail || 'Failed to attach to session');
             }
-            
+
             const result = await response.json();
             console.log('Attached to session:', result);
-            
+
             // Create a new tab for the attached session
             const tab = new TerminalTab(result.uuid, result.name);
-            tab.app=this;
+            tab.app = this;
             this.tabs.push(tab);
             await tab.connect();
 
@@ -1145,7 +1222,7 @@ class App {
             this.closeSessionsModal();
             this.closeSearchModal();
             this.hideLoading();
-            
+
             // Save state after restoring session
             this.saveTabState();
         } catch (error) {
@@ -1156,8 +1233,7 @@ class App {
     }
 
     closeSessionsModal() {
-        if (!document.getElementById('sessions-modal').classList.contains('hidden'))
-        {
+        if (!document.getElementById('sessions-modal').classList.contains('hidden')) {
             document.getElementById('sessions-modal').classList.add('hidden');
         }
     }
