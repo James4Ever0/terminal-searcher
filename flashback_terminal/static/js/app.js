@@ -709,6 +709,9 @@ class App {
             previewContainer.style.display = 'block';
 
             FrontendLogger.debug(`Showing preview for tab: ${tab.name}`);
+
+            // scroll to xterm-cursor.
+            this.scrollToLastHighlight(previewContainer, "xterm-cursor");
         }, 500); // 500ms delay
     }
 
@@ -987,12 +990,7 @@ class App {
                 markInstance.mark(query, {
                     className: 'search-highlight',
                     caseSensitive: false,
-                    exclude: ['script', 'style', 'title', 'head', 'html'],
-                    // done: () => {
-                    // Not working, since at this moment the area is not visible.
-                    //     // Auto-scroll to first highlighted element
-                    //     this.scrollToFirstHighlight(previewContent);
-                    // }
+                    exclude: ['script', 'style', 'title', 'head', 'html']
                 });
             }
             
@@ -1031,8 +1029,8 @@ class App {
             tooltip.style.left = `${leftPosition}px`;
             tooltip.style.top = `${topPosition}px`;
 
-            // this.scrollToFirstHighlight(tooltip);
-            this.scrollToLastHighlight(tooltip);
+            // this.scrollToFirstHighlight(tooltip, 'search-highlight');
+            this.scrollToLastHighlight(tooltip, 'search-highlight');
         }
     }
 
@@ -1062,12 +1060,7 @@ class App {
                 markInstance.mark(query, {
                     className: 'search-highlight',
                     caseSensitive: false,
-                    exclude: ['script', 'style', 'title', 'head', 'html'],
-                    // not working, the modal is not ready yet.
-                    // done: () => {
-                    //     // Auto-scroll to first highlighted element
-                    //     this.scrollToFirstHighlight(previewContent);
-                    // }
+                    exclude: ['script', 'style', 'title', 'head', 'html']
                 });
             }
             
@@ -1076,8 +1069,8 @@ class App {
             
             // Add escape key listener
             document.addEventListener('keydown', this.handleEscapeKey);
-            // this.scrollToFirstHighlight(modal);
-            this.scrollToLastHighlight(modal);
+            // this.scrollToFirstHighlight(modal, 'search-highlight');
+            this.scrollToLastHighlight(modal, 'search-highlight');
         }
     }
     
@@ -1097,8 +1090,8 @@ class App {
     }
 
     // more useful than scrollToFirstHighlight.
-    scrollToLastHighlight(container) {
-        const searchHighlights = container.getElementsByClassName('search-highlight');
+    scrollToLastHighlight(container, className) {
+        const searchHighlights = container.getElementsByClassName(className);
         // console.log("search highlight selected elements:", firstHighlight)
         if (searchHighlights.length !== 0) {
             // Scroll the highlighted element into view
@@ -1111,8 +1104,8 @@ class App {
         }
     }
 
-    scrollToFirstHighlight(container) {
-        const firstHighlight = container.querySelector('.search-highlight');
+    scrollToFirstHighlight(container, className) {
+        const firstHighlight = container.querySelector('.'+className);
         console.log("search highlight selected elements:", firstHighlight)
         if (firstHighlight) {
             // Scroll the highlighted element into view
