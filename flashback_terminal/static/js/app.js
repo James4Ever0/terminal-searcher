@@ -389,6 +389,16 @@ class App {
 
         FrontendLogger.info(`Restoring ${savedState.tabs.length} tabs from saved state`);
 
+
+        // Create a map of UUID to target position from saved state
+        const uuidToTargetIndex = new Map();
+        savedState.tabs.forEach((savedTab, index) => {
+            uuidToTargetIndex.set(savedTab.uuid, index);
+        });
+
+        console.log("UUID to target index:");
+        console.dir(uuidToTargetIndex);
+
         const restoredTabs = [];
         let activeTabRestored = null;
 
@@ -396,11 +406,9 @@ class App {
             // Show progress overlay
             this.showRestoreProgress(savedState.tabs.length);
 
-            let currentTab = 0;
-            for (const savedTab of savedState.tabs) {
-                currentTab++;
-                this.updateRestoreProgress(currentTab, savedState.tabs.length);
-
+            // Create restoration tasks for all tabs
+            let completedCount = 0;
+            const restorationTasks = savedState.tabs.map(async (savedTab, index) => {
                 try {
                     // Try to attach to existing session
                     const response = await fetch(`/api/sessions/${savedTab.uuid}/attach`, {
@@ -419,17 +427,48 @@ class App {
 
                         this.tabs.push(tab);
                         await tab.connect();
-                        restoredTabs.push(tab);
+
+                        // Update progress when this tab completes
+                        completedCount++;
+                        this.updateRestoreProgress(completedCount, savedState.tabs.length);
 
                         // Set as active tab if it was the active one
                         if (savedTab.uuid === savedState.activeTabUuid) {
-                            activeTabRestored = tab;
+                            return { tab, isActive: true };
                         }
+                        return { tab, isActive: false };
                     } else {
                         FrontendLogger.warn(`Failed to restore tab: ${savedTab.name} (${savedTab.uuid}) - session may not be available`);
+                        // Update progress even for failed tabs
+                        completedCount++;
+                        this.updateRestoreProgress(completedCount, savedState.tabs.length);
+                        return null;
                     }
                 } catch (error) {
                     FrontendLogger.error(`Error restoring tab ${savedTab.name}:`, error);
+                    // Update progress even for errored tabs
+                    completedCount++;
+                    this.updateRestoreProgress(completedCount, savedState.tabs.length);
+                    return null;
+                }
+            });
+
+            // Execute all restoration tasks concurrently
+            const results = await Promise.all(restorationTasks);
+
+            // Reorder tabs according to saved state order
+            this.reorderTabsBySavedState(uuidToTargetIndex);
+
+            // Process results
+            const restoredTabs = [];
+            let activeTabRestored = null;
+
+            for (const result of results) {
+                if (result) {
+                    restoredTabs.push(result.tab);
+                    if (result.isActive) {
+                        activeTabRestored = result.tab;
+                    }
                 }
             }
 
@@ -1592,6 +1631,21 @@ class App {
             overlay.classList.add('hidden');
             FrontendLogger.info('Hiding restore progress overlay');
         }
+    }
+
+    reorderTabsBySavedState(uuidToTargetIndex) {
+        // Sort current tabs by their saved order
+        this.tabs.sort((a, b) => {
+            // if the value is zero, the logic shortcut would get fucked. so we plus one.
+            const aIndex = (uuidToTargetIndex.get(a.uuid)+1) || Number.MAX_SAFE_INTEGER;
+            const bIndex = (uuidToTargetIndex.get(b.uuid)+1) || Number.MAX_SAFE_INTEGER;
+            console.log("aIndex:", aIndex, "bIndex:", bIndex, "aUUID:", a.uuid, 
+                "bUUID", b.uuid
+            )
+            return (aIndex-bIndex);
+        });
+
+        FrontendLogger.info(`Tabs reordered according to saved state: ${this.tabs.map(t => t.uuid).join(', ')}`);
     }
 }
 
