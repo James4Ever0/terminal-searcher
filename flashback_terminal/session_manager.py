@@ -345,8 +345,8 @@ set -g default-terminal "screen-256color"
                 env=env,
             )
             stdout, stderr = await process.communicate(input)
-            logger.debug("[TmuxSession] Process stdout:\n%s"%stdout)
-            logger.debug("[TmuxSession] Process stderr:\n%s"%stderr)
+            logger.debug("[TmuxSession] Process stdout:\n%s"% stdout)
+            logger.debug("[TmuxSession] Process stderr:\n%s"% stderr)
         else:
             process = await asyncio.create_subprocess_exec(
                 *cmd,

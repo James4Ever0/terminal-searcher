@@ -199,7 +199,7 @@ class WhooshIndexAsync:
                 await self._save_doc_ids(new_doc_ids)
                 logger.debug(f"[WhooshIndexAsync] Added {len(new_doc_ids)} new documents to index")
     
-    async def query(self, query_text:str, top_n:int = 10, filter_ids: list[int]=[]) -> List[Tuple[str, float]]:
+    async def query(self, query_text:str, top_n:int = 10, filter_ids: list[int]=[], doc_ids: list[int] = []) -> List[Tuple[str, float]]:
         """
         Search the index with a query and return the top matching documents.
         
@@ -211,6 +211,8 @@ class WhooshIndexAsync:
             Number of top results to return (default 10).
         filter_ids: list[int], optional
             Session IDs to include in the search result.
+        doc_ids: list[int], optional
+            Document IDs to include in the search result.
             
         Returns
         -------
@@ -218,10 +220,10 @@ class WhooshIndexAsync:
             Sorted list of document IDs and their relevance scores, highest first.
         """
         loop = asyncio.get_event_loop()
-        ret = await loop.run_in_executor(None, self._query, query_text, top_n, filter_ids)
+        ret = await loop.run_in_executor(None, self._query, query_text, top_n, filter_ids, doc_ids)
         return ret
 
-    def _query(self, query_text: str, top_n: int = 10, filter_ids: list[int]=[]) -> List[Tuple[str, float]]:
+    def _query(self, query_text: str, top_n: int = 10, filter_ids: list[int]=[], doc_ids: list[int]=[]) -> List[Tuple[str, float]]:
         """Synchronized query"""
         if not self.index:
             return []
@@ -230,16 +232,28 @@ class WhooshIndexAsync:
             searcher = self.index.searcher()
             parser = QueryParser("content", self.schema)
             query = parser.parse(query_text)
+            
+            query_filter = None
 
             if filter_ids:
                 # join with "or"
-                query_filter = None
                 for _id in filter_ids:
                     id_str = str(_id)
                     if query_filter is None:
                         query_filter = Term("session_id", id_str)
                     else:
                         query_filter = query_filter | Term("session_id", id_str)
+            
+            if doc_ids:
+                # join with "or"
+                for _id in doc_ids:
+                    id_str = str(_id)
+                    if query_filter is None:
+                        query_filter = Term("doc_id", id_str)
+                    else:
+                        query_filter = query_filter | Term("doc_id", id_str)
+            
+            if query_filter is not None:
                 results = searcher.search(query, limit=top_n, filter=query_filter)
             else:
                 results = searcher.search(query, limit=top_n)

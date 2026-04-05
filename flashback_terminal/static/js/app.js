@@ -121,13 +121,20 @@ class TerminalTab {
 
             // Check backend health first
             try {
-                const healthResponse = await fetch('/healthcheck');
-                const isBackendHealthy = healthResponse.ok;
+                var isBackendHealthy=false;
+                try{
+                    const healthResponse = await fetch('/healthcheck');
+                    isBackendHealthy = healthResponse.ok;
+
+                } catch {
+                    // cannot connect to backend, so the backend is not running. waiting for reconnect.
+                    FrontendLogger.info("Healthcheck failed, likely server close.")
+                }
 
                 if (!isBackendHealthy) {
                     // Backend is down, likely network issue
                     FrontendLogger.warn('Backend healthcheck failed - possible network issue');
-                    // TODO: Show reconnect notification when backend is back
+                    // TODO: Show reconnect notification when backend is back, run infinite loop for waiting terminal back on line?
                     return;
                 }
 
@@ -796,6 +803,9 @@ class App {
         
         // Show the modal
         document.getElementById('search-modal').classList.remove('hidden');
+        
+        // Add escape key listener
+        document.addEventListener('keydown', this.handleEscapeKeyForSearch);
     }
 
     async doSearch() {
@@ -1083,10 +1093,29 @@ class App {
         }
     }
     
+
+    handleEscapeKeyForSearch = (event) => {
+        if (event.key === 'Escape') {
+            // Check if expanded preview is open first (higher priority)
+            const expandedModal = document.getElementById('expanded-preview-modal');
+            if (expandedModal && !expandedModal.classList.contains('hidden')) {
+                this.closeExpandedPreview();
+                event.stopPropagation();
+                return; // Don't close search modal if expanded preview was open
+            }
+            // Only close search modal if expanded preview is not open
+            this.closeSearchModal();
+            event.stopPropagation();
+            document.removeEventListener("keydown", this.handleEscapeKeyForSearch);
+        }
+    }
+
     handleEscapeKey = (event) => {
         if (event.key === 'Escape') {
             this.closeExpandedPreview();
         }
+        // stop event propagation
+        event.stopPropagation();
     }
 
     // more useful than scrollToFirstHighlight.
@@ -1145,6 +1174,8 @@ class App {
         
         if (!document.getElementById('search-modal').classList.contains('hidden')) {
             document.getElementById('search-modal').classList.add('hidden');
+            // Remove escape key listener
+            document.removeEventListener('keydown', this.handleEscapeKey);
         }
     }
 

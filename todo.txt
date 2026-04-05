@@ -35,3 +35,5 @@
 - [ ] highlight keyword when terminal text result showing up, using backend?
 - [ ] store terminal text hash alongside with screenshot text, if last hash is equal to current screenshot hash then will drop the capture
 - [ ] change search result layout, organize terminal by uuid, title, show result timestamp in each terminal group tab, one can preview search result with keyword highlight when hover on the timestamp
+- [ ] need to sort search result by timestamp, need to limit search scope of certain ids.
+- [ ] need to just view different terminal screenshots by timeline.
