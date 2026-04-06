@@ -20,6 +20,7 @@
                 <button id="btn-new-tab">+ New Tab</button>
                 <button id="btn-search">Search</button>
                 <button id="btn-sessions">Sessions</button>
+                <button id="btn-timeline">Timeline</button>
             </div>
         </div>
         <div id="terminal-container"></div>
@@ -63,7 +64,13 @@
     <div id="expanded-preview-modal" class="modal hidden">
         <div class="expanded-preview-content">
             <div class="expanded-preview-header">
-                <h3>Search Result Preview</h3>
+                <div class="header-section">
+                    <h3>Search Result Preview</h3>
+                    <div class="header-buttons">
+                        <button id="search-result-timeline">View in timeline</button>
+                        <button id="search-result-detail">Details</button>
+                    </div>
+                </div>
                 <span class="close-btn" onclick="app.closeExpandedPreview()">&times;</span>
             </div>
             <div class="expanded-preview-body" id="expanded-preview-body"></div>

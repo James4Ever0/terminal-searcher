@@ -476,6 +476,7 @@ class App {
         });
         document.getElementById('btn-search').addEventListener('click', () => this.openSearch());
         document.getElementById('btn-sessions').addEventListener('click', () => this.openSessions());
+        document.getElementById('btn-timeline').addEventListener('click', () => this.openTimeline());
 
         document.querySelectorAll('.close-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
@@ -1246,6 +1247,28 @@ class App {
     async openSessions() {
         document.getElementById('sessions-modal').classList.remove('hidden');
         await this.loadSessions();
+    }
+
+    openTimeline(options) {
+        let url = "/timeline";
+        let uuid = options? options.uuid : null;
+        let timestamp = options? options.timestamp: null;
+
+        let query_params = [];
+
+        if (uuid) {
+            query_params.push("uuid="+uuid);
+        }
+
+        if (timestamp) {
+            query_params.push("timestamp="+timestamp);
+        }
+
+        if (query_params.length > 0){
+            url += "?" + query_params.join("&")
+        }
+
+        window.open(url, '_blank');
     }
 
     async loadSessions() {
